@@ -1085,4 +1085,67 @@ mod tests {
             "query=The%20Dark%20Knight"
         );
     }
+
+    // The two fixtures below are trimmed captures of real
+    // `api/releases/{imdb_id}` responses, kept so the parser stays pinned to
+    // the shapes the provider actually serves.
+
+    #[test]
+    fn live_movie_payload_yields_candidates() {
+        let payload: Value = serde_json::from_str(
+            r#"{"subs":[
+                {"id":9229,"version":"Inception.2010.Bluray.1080p.DTS-HDMA.x264.dxva-FraMeSToR",
+                 "date":"10/24/2016","resolution":"1080p","format":"BluRay",
+                 "video_codec":"h264","audio_codec":"DTS","release_group":"FraMeSToR"},
+                {"id":90675,"version":"Inception.2010.DVDRip.XviD.RoSubbed-playOFF",
+                 "date":"12/9/2016","format":"DVD","video_codec":"XviD","release_group":"playOFF"}
+            ]}"#,
+        )
+        .expect("movie payload");
+        let subs = collect_subs(
+            payload.get("subs"),
+            SubtitleQueryMediaKind::Movie,
+            None,
+            None,
+        );
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subtitle_id(&subs[0]).as_deref(), Some("9229"));
+        assert!(subs[0].version.contains("FraMeSToR"));
+    }
+
+    #[test]
+    fn live_series_payload_yields_candidates() {
+        // Real series responses key `subs` by season string, then by episode
+        // string — not by array position.
+        let payload: Value = serde_json::from_str(
+            r#"{"subs":{"1":{"1":[
+                {"id":60186,"version":"Breaking.Bad.S01E01.720p.BluRay.x264-CtrlHD",
+                 "date":"10/26/2016","resolution":"720p","format":"BluRay",
+                 "video_codec":"h264","release_group":"CtrlHD"},
+                {"id":1066,"version":"Breaking.Bad.S01E01.720p.HDTV.X264-BiA",
+                 "date":"10/23/2016","resolution":"720p","format":"HDTV",
+                 "video_codec":"h264","release_group":"BiA"}
+            ]}}}"#,
+        )
+        .expect("series payload");
+        let subs = collect_subs(
+            payload.get("subs"),
+            SubtitleQueryMediaKind::Episode,
+            Some(1),
+            Some(1),
+        );
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subtitle_id(&subs[0]).as_deref(), Some("60186"));
+
+        // A season or episode the payload does not carry stays empty.
+        assert!(
+            collect_subs(
+                payload.get("subs"),
+                SubtitleQueryMediaKind::Episode,
+                Some(2),
+                Some(1)
+            )
+            .is_empty()
+        );
+    }
 }
