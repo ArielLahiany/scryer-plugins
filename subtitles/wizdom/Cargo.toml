@@ -1,0 +1,33 @@
+[package]
+name = "wizdom-subtitle-provider"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Hebrew subtitle provider for Wizdom with IMDb-keyed search and zip downloads"
+
+[package.metadata.scryer]
+official = true
+plugin_id = "wizdom"
+status = "beta"
+catalog_versions = ["v3"]
+min_scryer_version = "0.18.0"
+feature_sets = [{ required_features = [] }, { required_features = ["simd128", "relaxed-simd"] }]
+docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/subtitles/wizdom"
+source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/subtitles/wizdom"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.23"
+extism-pdk = "1.4"
+scryer-plugin-sdk = "3.7.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.plugin-release]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+strip = true
+panic = "abort"
