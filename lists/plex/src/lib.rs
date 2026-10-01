@@ -73,6 +73,8 @@ const ACCEPT: &str = "application/rss+xml, application/xml;q=0.9, */*;q=0.1";
 const ACCEPT_JSON: &str = "application/json";
 /// Six hours, the watchlist interval the other arrs use.
 const DEFAULT_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+/// Spacing between Plex requests, the one the other arrs keep for Plex.
+const RATE_LIMIT_SECONDS: i64 = 5;
 /// Titles asked for per watchlist page, the page size the other arrs use.
 pub const PAGE_SIZE: u32 = 100;
 /// Requests per sync of the member watchlist: two thousand titles at full
@@ -183,7 +185,7 @@ pub fn descriptor() -> PluginDescriptor {
                 DISCOVER_HOST.to_string(),
                 ACCOUNT_HOST.to_string(),
             ],
-            rate_limit_seconds: None,
+            rate_limit_seconds: Some(RATE_LIMIT_SECONDS),
         }),
     }
 }
