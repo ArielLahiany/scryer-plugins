@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use list_provider_common::testing::{RecordedHttp, block_on};
 use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::{
-    ListMediaKind, ListPluginFetchRequest, ListPluginHealthRequest, PluginDescriptor,
-    PluginErrorCode, PluginResult,
+    ListMediaKind, ListPluginAccountRequest, ListPluginFetchRequest, ListPluginHealthRequest,
+    PluginDescriptor, PluginErrorCode, PluginResult,
 };
 
 use super::*;
@@ -100,8 +100,11 @@ fn descriptor_round_trips_and_passes_host_checks() {
     assert_eq!(list.provider_type, "tmdb");
     assert_eq!(
         list.auth,
-        ListProviderAuth::ServerApiKey {
-            config_field: CONFIG_API_KEY.to_string()
+        ListProviderAuth::MemberAccount {
+            flow: ListAccountFlow::TmdbApproval,
+            exchange: ListAccountExchange::Direct,
+            byo_app: false,
+            scopes: Vec::new(),
         }
     );
     assert!(list.capabilities.health);
@@ -111,10 +114,9 @@ fn descriptor_round_trips_and_passes_host_checks() {
             .any(|field| field.key == CONFIG_API_KEY)
     );
     assert_eq!(list.allowed_hosts, vec!["api.themoviedb.org".to_string()]);
-    let sources: Vec<_> = list
-        .groups
+    let sources: Vec<_> = list.groups[0]
+        .items
         .iter()
-        .flat_map(|group| &group.items)
         .map(|item| item.source_type.as_str())
         .collect();
     assert_eq!(sources, vec!["list", "person", "company", "keyword"]);
@@ -469,4 +471,589 @@ fn health_reports_key_state() {
         err(health(&down, Some(KEY))).code,
         PluginErrorCode::UpstreamUnavailable
     );
+}
+
+const MEMBER_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJtZW1iZXIiOnRydWV9.bWVtYmVyc2lnbg";
+const ACCOUNT_ID: &str = "fixture0account0object01";
+
+fn member() -> ListCredential {
+    ListCredential {
+        access_token: MEMBER_TOKEN.to_string(),
+        token_type: Some("Bearer".to_string()),
+        external_user_id: Some(ACCOUNT_ID.to_string()),
+        username: Some("fixture-member".to_string()),
+    }
+}
+
+fn v4(path_and_query: &str) -> String {
+    format!("{API_V4_BASE}{path_and_query}")
+}
+
+fn account_url(path_and_query: &str) -> String {
+    v4(&format!("/account/{ACCOUNT_ID}{path_and_query}"))
+}
+
+fn personal_request(
+    source_type: &str,
+    params: &[(&str, &str)],
+    cursor: Option<&str>,
+) -> ListPluginFetchRequest {
+    ListPluginFetchRequest {
+        credential: Some(member()),
+        ..request(source_type, params, cursor)
+    }
+}
+
+fn account(
+    http: &RecordedHttp,
+    credential: ListCredential,
+) -> PluginResult<ListPluginAccountResponse> {
+    match block_on(run(
+        http,
+        Some(KEY),
+        PluginListCommand::Account(ListPluginAccountRequest { credential }),
+    )) {
+        PluginListCommandResult::Account(result) => result,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A member call goes to the v4 API with the member's token as the bearer,
+/// and neither the token nor the server key appears anywhere else.
+fn assert_member_call(sent: &PluginHttpRequest, expected_url: &str) {
+    assert_eq!(sent.url, expected_url);
+    assert_eq!(
+        sent.headers.get("Authorization").map(String::as_str),
+        Some(format!("Bearer {MEMBER_TOKEN}").as_str())
+    );
+    assert!(!sent.url.contains(MEMBER_TOKEN));
+    assert!(!sent.url.contains("api_key") && !sent.url.contains(KEY));
+    for value in sent.headers.values() {
+        assert!(!value.contains(KEY) && !value.contains(BEARER));
+    }
+}
+
+fn assert_no_secrets(error: &scryer_plugin_sdk::PluginError) {
+    let rendered = serde_json::to_string(error).unwrap();
+    assert!(!rendered.contains(MEMBER_TOKEN) && !rendered.contains(KEY));
+}
+
+#[test]
+fn personal_sources_form_their_own_member_group() {
+    let list = descriptor().list_provider().cloned().unwrap();
+    assert_eq!(list.groups.len(), 2);
+
+    let public = &list.groups[0];
+    assert_eq!(public.auth_badge, ListAuthBadge::ServerApiKey);
+    assert!(public.items.iter().all(|item| !item.personal));
+
+    let mine = &list.groups[1];
+    assert_eq!(mine.auth_badge, ListAuthBadge::MemberAccount);
+    let sources: Vec<_> = mine
+        .items
+        .iter()
+        .map(|item| item.source_type.as_str())
+        .collect();
+    assert_eq!(sources, vec!["watchlist", "favorites", "account_list"]);
+    for item in &mine.items {
+        assert!(item.personal);
+        assert_eq!(item.default_interval_seconds, 12 * 60 * 60);
+        assert_eq!(
+            item.kinds,
+            vec![ListMediaKind::Movie, ListMediaKind::Series]
+        );
+    }
+    for item in &mine.items[..2] {
+        let [kind] = &item.params[..] else {
+            panic!("{} takes only a media kind", item.id);
+        };
+        assert_eq!(kind.key, PARAM_KIND);
+        assert!(!kind.required);
+        assert_eq!(kind.options, vec!["all", "movie", "series"]);
+    }
+    let [list_id] = &mine.items[2].params[..] else {
+        panic!("an account list takes only its id");
+    };
+    assert_eq!(list_id.key, PARAM_LIST_ID);
+    assert!(list_id.required);
+
+    assert!(list.capabilities.account);
+    assert!(!list.capabilities.requires_member_credential);
+    // A pasted address always resolves to a public source.
+    assert!(list.url_patterns.iter().all(|pattern| {
+        public
+            .items
+            .iter()
+            .any(|item| item.source_type == pattern.source_type)
+    }));
+}
+
+#[test]
+fn watchlist_pages_movies_then_shows_with_the_member_token() {
+    let movies_1 = r#"{"page": 1, "total_pages": 2, "total_results": 21, "results": [
+      {"id": 990501, "media_type": "movie", "title": "Fixture Watch Alpha", "release_date": "2032-01-01",
+       "vote_average": 6.5, "vote_count": 40},
+      {"id": 990502, "media_type": "movie", "title": "Fixture Watch Beta", "release_date": "2031-06-06"}
+    ]}"#;
+    let movies_2 = r#"{"page": 2, "total_pages": 2, "total_results": 21, "results": [
+      {"id": 990503, "media_type": "movie", "title": "Fixture Watch Gamma", "release_date": "2030-02-02"}
+    ]}"#;
+    let shows_1 = r#"{"page": 1, "total_pages": 1, "total_results": 1, "results": [
+      {"id": 990601, "media_type": "tv", "name": "Fixture Watch Serial", "first_air_date": "2029-09-09"}
+    ]}"#;
+    let movie_page = |page| {
+        account_url(&format!(
+            "/movie/watchlist?sort_by=created_at.desc&page={page}"
+        ))
+    };
+    let show_page = account_url("/tv/watchlist?sort_by=created_at.desc&page=1");
+    let http = RecordedHttp::new()
+        .with(&movie_page(1), 200, movies_1)
+        .with(&movie_page(2), 200, movies_2)
+        .with(&show_page, 200, shows_1);
+
+    let first = ok(fetch(
+        &http,
+        Some(KEY),
+        personal_request("watchlist", &[], None),
+    ));
+    let keys: Vec<_> = first
+        .items
+        .iter()
+        .map(|item| item.item_key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["tmdb:movie:990501", "tmdb:movie:990502"]);
+    assert_eq!(first.items[0].rank, Some(1));
+    assert_eq!(first.items[0].kind_hint, Some(ListMediaKind::Movie));
+    assert_eq!(first.next_cursor.as_deref(), Some("movie:2:0"));
+    assert!(first.fingerprint.is_none() && first.total_hint.is_none());
+    assert!(first.list_url.is_none());
+
+    let second = ok(fetch(
+        &http,
+        Some(KEY),
+        personal_request("watchlist", &[], first.next_cursor.as_deref()),
+    ));
+    assert_eq!(second.items[0].item_key, "tmdb:movie:990503");
+    assert_eq!(second.items[0].rank, Some(21));
+    assert_eq!(
+        second.next_cursor.as_deref(),
+        Some("series:1:21"),
+        "shows follow the last movie"
+    );
+
+    let third = ok(fetch(
+        &http,
+        Some(KEY),
+        personal_request(
+            "watchlist",
+            &[("kind", "all")],
+            second.next_cursor.as_deref(),
+        ),
+    ));
+    assert_eq!(third.items[0].item_key, "tmdb:series:990601");
+    assert_eq!(third.items[0].rank, Some(22));
+    assert!(third.next_cursor.is_none());
+
+    let sent = http.requests();
+    assert_eq!(sent.len(), 3);
+    for (request, expected) in sent.iter().zip([movie_page(1), movie_page(2), show_page]) {
+        assert_member_call(request, &expected);
+    }
+
+    // The server key is not needed for a member's own sources.
+    let keyless = RecordedHttp::new().with(&movie_page(1), 200, movies_1);
+    assert_eq!(
+        ok(fetch(
+            &keyless,
+            None,
+            personal_request("watchlist", &[], None)
+        ))
+        .items
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn favorites_page_one_kind_by_number() {
+    let shows = r#"{"page": 1, "total_pages": 80, "total_results": 1600, "results": [
+      {"id": 990611, "name": "Fixture Favorite Serial", "first_air_date": "2028-03-03"}
+    ]}"#;
+    let page = |page| {
+        account_url(&format!(
+            "/tv/favorites?sort_by=created_at.desc&page={page}"
+        ))
+    };
+    let http = RecordedHttp::new()
+        .with(&page(1), 200, shows)
+        .with(&page(MAX_PAGES), 200, shows);
+
+    let first = ok(fetch(
+        &http,
+        None,
+        personal_request("favorites", &[("kind", "series")], None),
+    ));
+    assert_eq!(
+        first.items[0].item_key, "tmdb:series:990611",
+        "favorites carry no media type; the endpoint's kind decides"
+    );
+    assert_eq!(first.next_cursor.as_deref(), Some("2"));
+    assert_eq!(first.total_hint, Some(MAX_PAGES * 20));
+
+    let last = ok(fetch(
+        &http,
+        None,
+        personal_request("favorites", &[("kind", "series")], Some("50")),
+    ));
+    assert!(
+        last.next_cursor.is_none(),
+        "page {MAX_PAGES} is the last one followed"
+    );
+    assert_eq!(last.items[0].rank, Some(981));
+    assert_member_call(&http.requests()[0], &page(1));
+
+    // With both kinds, an empty movie side hands straight over to shows.
+    let empty = RecordedHttp::new().with(
+        &account_url("/movie/favorites?sort_by=created_at.desc&page=1"),
+        200,
+        r#"{"page": 1, "total_pages": 0, "total_results": 0, "results": []}"#,
+    );
+    let none = ok(fetch(
+        &empty,
+        None,
+        personal_request("favorites", &[], None),
+    ));
+    assert!(none.items.is_empty());
+    assert_eq!(none.next_cursor.as_deref(), Some("series:1:0"));
+}
+
+#[test]
+fn account_list_reads_the_members_list_with_their_token() {
+    let body = r#"{
+      "id": 8200001, "name": "Fixture Private Shelf", "public": false, "page": 1,
+      "total_pages": 1, "total_results": 2,
+      "results": [
+        {"id": 990201, "media_type": "movie", "title": "Fixture Feature Alpha", "release_date": "2031-03-04"},
+        {"id": 990202, "media_type": "tv", "name": "Fixture Serial Beta", "first_air_date": "2029-10-01"}
+      ]
+    }"#;
+    let http = RecordedHttp::new()
+        .with(&v4("/list/8200001?page=1"), 200, body)
+        .with(&url("/list/8100001?page=1"), 200, LIST_PAGE_1);
+
+    // The server key here is itself a bearer token; it still never stands in
+    // for the member's.
+    let mine = ok(fetch(
+        &http,
+        Some(BEARER),
+        personal_request("account_list", &[("list_id", "8200001")], None),
+    ));
+    assert_member_call(&http.requests()[0], &v4("/list/8200001?page=1"));
+    assert_eq!(mine.list_name.as_deref(), Some("Fixture Private Shelf"));
+    assert_eq!(
+        mine.list_url.as_deref(),
+        Some("https://www.themoviedb.org/list/8200001")
+    );
+    assert_eq!(mine.total_hint, Some(2));
+    assert!(mine.next_cursor.is_none());
+
+    // The same titles get the same keys as on a public list.
+    let public = ok(fetch(
+        &http,
+        Some(KEY),
+        request("list", &[("list_id", "8100001")], None),
+    ));
+    let keys = |response: &scryer_plugin_sdk::ListPluginFetchResponse| {
+        response
+            .items
+            .iter()
+            .map(|item| item.item_key.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&mine), keys(&public));
+}
+
+#[test]
+fn public_sources_ignore_a_member_credential() {
+    let http = RecordedHttp::new()
+        .with(&url("/list/8100001?page=1"), 200, LIST_PAGE_1)
+        .with(&format!("{API_BASE}/list/8100001?page=1"), 200, LIST_PAGE_1);
+    let with_member = |key| {
+        let mut public = request("list", &[("list_id", "8100001")], None);
+        public.credential = Some(member());
+        ok(fetch(&http, Some(key), public));
+    };
+
+    with_member(KEY);
+    with_member(BEARER);
+    let sent = http.requests();
+    assert_eq!(sent[0].url, url("/list/8100001?page=1"));
+    assert!(!sent[0].headers.contains_key("Authorization"));
+    assert_eq!(
+        sent[1].headers.get("Authorization").map(String::as_str),
+        Some(format!("Bearer {BEARER}").as_str())
+    );
+    for request in &sent {
+        assert!(request.url.starts_with(API_BASE));
+        assert!(!request.url.contains(MEMBER_TOKEN));
+        assert!(
+            request
+                .headers
+                .values()
+                .all(|value| !value.contains(MEMBER_TOKEN))
+        );
+    }
+
+    // Without a server key a public source still fails as unconfigured,
+    // whatever the member has linked.
+    let mut keyless = request("list", &[("list_id", "8100001")], None);
+    keyless.credential = Some(member());
+    assert_eq!(
+        err(fetch(&RecordedHttp::new(), None, keyless)).code,
+        PluginErrorCode::InvalidConfig
+    );
+}
+
+#[test]
+fn account_names_the_member_and_their_lists() {
+    let lists_1 = r#"{"page": 1, "total_pages": 2, "total_results": 3, "results": [
+      {"id": 8200001, "name": "Fixture Private Shelf", "public": 0, "number_of_items": 2},
+      {"id": 8200002, "name": "Fixture Weekend Queue", "public": 1, "number_of_items": 0}
+    ]}"#;
+    let lists_2 =
+        r#"{"page": 2, "total_pages": 2, "total_results": 3, "results": [{"id": 8200003}]}"#;
+    let first_list = format!(
+        r#"{{"id": 8200001, "name": "Fixture Private Shelf", "page": 1, "total_pages": 1, "results": [],
+           "created_by": {{"id": "{ACCOUNT_ID}", "username": "fixture-member-handle",
+                           "name": "Fixture Member", "avatar_path": "/fixtureavatar.png", "gravatar_hash": ""}}}}"#
+    );
+    let http = RecordedHttp::new()
+        .with(&account_url("/lists?page=1"), 200, lists_1)
+        .with(&account_url("/lists?page=2"), 200, lists_2)
+        .with(&v4("/list/8200001?page=1"), 200, &first_list);
+
+    let linked = ok(account(&http, member()));
+    assert_eq!(linked.external_user_id, ACCOUNT_ID);
+    assert_eq!(linked.username, "fixture-member-handle");
+    assert_eq!(linked.display_name.as_deref(), Some("Fixture Member"));
+    assert_eq!(
+        linked.avatar_url.as_deref(),
+        Some("https://image.tmdb.org/t/p/original/fixtureavatar.png")
+    );
+    let lists: Vec<_> = linked
+        .owned_lists
+        .iter()
+        .map(|list| (list.id.as_str(), list.name.as_str()))
+        .collect();
+    assert_eq!(
+        lists,
+        vec![
+            ("8200001", "Fixture Private Shelf"),
+            ("8200002", "Fixture Weekend Queue"),
+            ("8200003", "List 8200003"),
+        ]
+    );
+    assert!(
+        linked
+            .owned_lists
+            .iter()
+            .all(|list| list.kinds == vec![ListMediaKind::Movie, ListMediaKind::Series])
+    );
+    assert!(linked.statuses.is_empty());
+    let sent = http.requests();
+    for (request, expected) in sent.iter().zip([
+        account_url("/lists?page=1"),
+        account_url("/lists?page=2"),
+        v4("/list/8200001?page=1"),
+    ]) {
+        assert_member_call(request, &expected);
+    }
+    assert_eq!(sent.len(), 3);
+
+    // A member without lists is named by the credential, or by the account id.
+    let no_lists = RecordedHttp::new().with(
+        &account_url("/lists?page=1"),
+        200,
+        r#"{"page": 1, "total_pages": 0, "total_results": 0, "results": []}"#,
+    );
+    let bare = ok(account(&no_lists, member()));
+    assert_eq!(bare.username, "fixture-member");
+    assert!(bare.display_name.is_none() && bare.avatar_url.is_none());
+    assert!(bare.owned_lists.is_empty());
+    assert_eq!(no_lists.urls().len(), 1);
+    let anonymous = ListCredential {
+        username: None,
+        ..member()
+    };
+    assert_eq!(ok(account(&no_lists, anonymous)).username, ACCOUNT_ID);
+
+    // A first list owned by someone else lends the member no identity.
+    let foreign = RecordedHttp::new()
+        .with(
+            &account_url("/lists?page=1"),
+            200,
+            r#"{"total_pages": 1, "results": [{"id": 8200001}]}"#,
+        )
+        .with(
+            &v4("/list/8200001?page=1"),
+            200,
+            r#"{"created_by": {"id": "fixture0other0account0002", "username": "fixture-other"}}"#,
+        );
+    let named = ok(account(&foreign, member()));
+    assert_eq!(named.username, "fixture-member");
+    assert!(named.display_name.is_none());
+}
+
+#[test]
+fn a_rejected_member_token_is_an_expired_account() {
+    let watchlist = |status: u16, headers: &[(&str, &str)], body: &str| {
+        let http = RecordedHttp::new().with_headers(
+            &account_url("/movie/watchlist?sort_by=created_at.desc&page=1"),
+            status,
+            headers,
+            body,
+        );
+        err(fetch(
+            &http,
+            Some(KEY),
+            personal_request("watchlist", &[], None),
+        ))
+    };
+    let own_list = |status: u16, body: &str| {
+        let http = RecordedHttp::new().with(&v4("/list/8200001?page=1"), status, body);
+        err(fetch(
+            &http,
+            Some(KEY),
+            personal_request("account_list", &[("list_id", "8200001")], None),
+        ))
+    };
+
+    // Unlike a public source, where code 3 means a private resource, any 401
+    // on the member's own account means the link no longer works.
+    let mut errors = vec![
+        watchlist(
+            401,
+            &[],
+            r#"{"status_code": 3, "status_message": "Authentication failed"}"#,
+        ),
+        watchlist(401, &[], r#"{"status_code": 7}"#),
+        watchlist(401, &[], ""),
+        own_list(401, r#"{"status_code": 3}"#),
+    ];
+    let lists_401 =
+        RecordedHttp::new().with(&account_url("/lists?page=1"), 401, r#"{"status_code": 3}"#);
+    errors.push(err(account(&lists_401, member())));
+    for error in &errors {
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_no_secrets(error);
+    }
+
+    // A list TMDb calls private is not this member's to read; the account is
+    // fine.
+    let private = own_list(
+        401,
+        r#"{"status_code": 39, "status_message": "This resource is private."}"#,
+    );
+    assert_eq!(private.code, PluginErrorCode::Permanent);
+    assert!(private.public_message.contains("not found"));
+    let missing = own_list(404, r#"{"status_code": 34}"#);
+    assert!(missing.public_message.contains("not found"));
+
+    let limited = watchlist(429, &[("Retry-After", "12")], "");
+    assert_eq!(
+        (limited.code, limited.retry_after_seconds),
+        (PluginErrorCode::RateLimited, Some(12))
+    );
+    assert_eq!(
+        watchlist(503, &[], "").code,
+        PluginErrorCode::UpstreamUnavailable
+    );
+    for error in [private, missing, limited] {
+        assert_no_secrets(&error);
+    }
+}
+
+#[test]
+fn personal_sources_need_a_linked_account() {
+    let http = RecordedHttp::new();
+    let personal_with =
+        |source: &str, params: &[(&str, &str)], credential: Option<ListCredential>| {
+            let mut request = request(source, params, None);
+            request.credential = credential;
+            err(fetch(&http, Some(KEY), request))
+        };
+    let cases = [
+        ("watchlist", &[][..]),
+        ("favorites", &[("kind", "movie")][..]),
+        ("account_list", &[("list_id", "8200001")][..]),
+    ];
+    for (source, params) in cases {
+        for credential in [
+            None,
+            Some(ListCredential {
+                access_token: "  ".to_string(),
+                ..member()
+            }),
+            Some(ListCredential {
+                external_user_id: None,
+                ..member()
+            }),
+            Some(ListCredential {
+                external_user_id: Some(String::new()),
+                ..member()
+            }),
+        ] {
+            let error = personal_with(source, params, credential);
+            assert_eq!(error.code, PluginErrorCode::InvalidConfig, "{source}");
+            assert_no_secrets(&error);
+        }
+    }
+    assert_eq!(
+        err(account(
+            &http,
+            ListCredential {
+                external_user_id: None,
+                ..member()
+            }
+        ))
+        .code,
+        PluginErrorCode::InvalidConfig
+    );
+    assert_eq!(
+        personal_with("account_list", &[], Some(member())).code,
+        PluginErrorCode::InvalidConfig
+    );
+    assert_eq!(
+        personal_with("watchlist", &[("kind", "person")], Some(member())).code,
+        PluginErrorCode::InvalidConfig
+    );
+    assert!(http.urls().is_empty());
+}
+
+#[test]
+fn both_kind_cursors_are_validated() {
+    let http = RecordedHttp::new();
+    for cursor in [
+        "movie:0:0",
+        "show:1:0",
+        "movie:2",
+        "movie:x:0",
+        "series:1:-1",
+        "2",
+    ] {
+        let error = err(fetch(
+            &http,
+            None,
+            personal_request("watchlist", &[], Some(cursor)),
+        ));
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{cursor}");
+    }
+    let error = err(fetch(
+        &http,
+        None,
+        personal_request("favorites", &[("kind", "movie")], Some("series:1:0")),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(http.urls().is_empty());
 }
