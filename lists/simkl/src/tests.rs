@@ -343,7 +343,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
     assert!(!list.capabilities.health);
     assert!(list.capabilities.requires_member_credential);
     assert_eq!(list.allowed_hosts, vec!["api.simkl.com".to_string()]);
-    assert_eq!(list.rate_limit_seconds, Some(1));
+    assert_eq!(list.rate_limit_seconds, Some(2));
     assert!(
         list.config_fields.is_empty(),
         "no credential may live in plugin config"
@@ -865,6 +865,10 @@ fn requests_name_the_app_and_carry_the_token_only_in_a_header() {
             request.headers.get("Accept").map(String::as_str),
             Some("application/json")
         );
+        assert_eq!(
+            request.headers.get("Content-Type").map(String::as_str),
+            Some("application/json")
+        );
     }
 }
 
@@ -872,7 +876,8 @@ fn requests_name_the_app_and_carry_the_token_only_in_a_header() {
 fn upstream_failures_map_to_host_classes() {
     let cases = [
         (401, PluginErrorCode::AuthFailed, false),
-        (403, PluginErrorCode::AuthFailed, false),
+        // Simkl's 403 is the app's key or its limits, never the member.
+        (403, PluginErrorCode::UpstreamUnavailable, false),
         (404, PluginErrorCode::Permanent, true),
         (412, PluginErrorCode::UpstreamUnavailable, false),
         (429, PluginErrorCode::RateLimited, false),

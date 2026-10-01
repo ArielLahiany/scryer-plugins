@@ -88,6 +88,9 @@ const ACCEPT: &str = "application/json";
 const EXTENDED_ANIME_SEASONS: &str = "full_anime_seasons";
 /// Six hours, the interval the other arrs use for Simkl.
 const DEFAULT_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+/// Two seconds between fetches, the spacing Sonarr and Radarr give every
+/// list they read, Simkl included.
+const RATE_LIMIT_SECONDS: i64 = 2;
 /// The longest Simkl error name repeated in an error message.
 const MAX_ERROR_NAME_LEN: usize = 40;
 /// The host's external-id kind for ids that name an anime entry.
@@ -333,7 +336,7 @@ pub fn descriptor() -> PluginDescriptor {
             config_fields: Vec::new(),
             default_base_url: None,
             allowed_hosts: vec![API_HOST.to_string()],
-            rate_limit_seconds: Some(1),
+            rate_limit_seconds: Some(RATE_LIMIT_SECONDS),
         }),
     }
 }
@@ -436,6 +439,10 @@ impl<'a, H: ListHttp> Client<'a, H> {
 
     fn request(&self, path: &str, extended: Option<&str>) -> PluginHttpRequest {
         let mut request = get(self.url(path, extended), USER_AGENT, ACCEPT);
+        // Simkl lists both as required headers on every call.
+        request
+            .headers
+            .insert("Content-Type".to_string(), ACCEPT.to_string());
         request
             .headers
             .insert("simkl-api-key".to_string(), self.client_id.to_string());
@@ -555,8 +562,10 @@ fn response_error_name(response: &PluginHttpResponse) -> Option<String> {
 }
 
 /// Map a Simkl failure onto the host's classes. Every Simkl call here carries
-/// the member's token, so a 401 or 403 means the linked account no longer
-/// works; a 412 is Simkl refusing Scryer's app, not the member.
+/// the member's token, so a 401 means the linked account no longer works.
+/// Simkl documents a 403 as a bad or unapproved app key or a request over its
+/// limits, and a 412 as a bad client id or the app's total request limit, so
+/// both are Simkl refusing Scryer's app, not the member.
 fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
     let status = response.status;
     let detail = || match response_error_name(response) {
@@ -564,11 +573,11 @@ fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), P
         None => format!("HTTP {status}"),
     };
     match status {
-        401 | 403 => Err(auth_failed(format!(
+        401 => Err(auth_failed(format!(
             "Simkl rejected the linked account ({})",
             detail()
         ))),
-        412 => Err(unavailable(format!(
+        403 | 412 => Err(unavailable(format!(
             "Simkl refused Scryer's Simkl app ({}); it may be throttling the app",
             detail()
         ))),
