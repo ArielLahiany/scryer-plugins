@@ -4,9 +4,13 @@
 //!
 //! - `list`: a public list by id, paged through `/3/list/{id}`.
 //! - `person`: everything a person is credited on, from one
-//!   `/3/person/{id}?append_to_response=combined_credits` read.
+//!   `/3/person/{id}?append_to_response=combined_credits` read: their cast
+//!   credits, their crew credits, or the crew credits of one department.
 //! - `company` and `keyword`: TMDb discover filtered by the company or
 //!   keyword, newest first, paged.
+//!
+//! A paged source longer than [`MAX_PAGES`] pages fails rather than being cut
+//! short: the host would read every title past the cap as having left it.
 //!
 //! Parameterless charts (popular, top rated, upcoming and the rest) are served
 //! by the metadata gateway and are deliberately absent here.
@@ -15,12 +19,14 @@
 //! token (sent as a bearer token). It is server configuration declared in the
 //! descriptor.
 //!
-//! A member who links their own TMDb account can also follow three personal
+//! A member who links their own TMDb account can also follow five personal
 //! sources through TMDb's v4 account API, read with that member's v4 user
 //! access token and never with the server key:
 //!
-//! - `watchlist` and `favorites`: the member's watchlist or favorites, movies
-//!   and shows, newest first, paged.
+//! - `watchlist`, `favorites` and `rated`: the member's watchlist, favorites
+//!   or rated titles, movies and shows, newest first, paged.
+//! - `recommendations`: the titles TMDb recommends to the member, movies and
+//!   shows, in TMDb's order, paged.
 //! - `account_list`: one of the member's own lists, public or private, paged
 //!   through `/4/list/{id}`.
 //!
@@ -69,6 +75,8 @@ pub const SOURCE_COMPANY: &str = "company";
 pub const SOURCE_KEYWORD: &str = "keyword";
 pub const SOURCE_WATCHLIST: &str = "watchlist";
 pub const SOURCE_FAVORITES: &str = "favorites";
+pub const SOURCE_RATED: &str = "rated";
+pub const SOURCE_RECOMMENDATIONS: &str = "recommendations";
 pub const SOURCE_ACCOUNT_LIST: &str = "account_list";
 
 pub const PARAM_LIST_ID: &str = "list_id";
@@ -90,14 +98,15 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const ACCEPT: &str = "application/json";
 /// TMDb's fixed page size for lists and discover.
 const PAGE_SIZE: u32 = 20;
-/// Deepest discover page followed: 1,000 titles, well inside the host's
-/// hundred-page ceiling per sync and TMDb's own 500-page discover limit.
+/// Deepest page followed: 1,000 titles, the most the other arrs read from one
+/// list, well inside the host's hundred-page ceiling per sync and TMDb's own
+/// 500-page limit.
 pub const MAX_PAGES: u32 = 50;
 /// Twelve hours, the interval the other arrs use for TMDb lists.
 const DEFAULT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// TMDb status codes that mean the key itself is bad, as opposed to a
 /// resource the key may not read.
-const TMDB_INVALID_KEY_CODES: [i64; 3] = [7, 10, 30];
+const TMDB_INVALID_KEY_CODES: [i64; 4] = [7, 10, 30, 35];
 /// TMDb's "This resource is private" status.
 const TMDB_PRIVATE_RESOURCE_CODE: i64 = 39;
 /// Deepest page of a member's own lists the account operation reads: 200
@@ -106,6 +115,14 @@ const MAX_ACCOUNT_LIST_PAGES: u32 = 10;
 /// TV genres whose credits are appearances rather than work: talk shows and
 /// news.
 const APPEARANCE_TV_GENRES: [i64; 2] = [10767, 10763];
+/// The crew departments a person source can be narrowed to: the `credit`
+/// option, and the `department` TMDb gives each crew credit.
+const CREW_DEPARTMENTS: [(&str, &str); 4] = [
+    ("directing", "Directing"),
+    ("production", "Production"),
+    ("sound", "Sound"),
+    ("writing", "Writing"),
+];
 
 fn text_param(key: &str, label: &str) -> ListSourceParam {
     ListSourceParam {
@@ -187,7 +204,8 @@ pub fn descriptor() -> PluginDescriptor {
             blurb: Some(
                 "Follow a public TMDb list, everything a person is credited on, or \
                  everything from a company or keyword. Members who link their own TMDb \
-                 account can follow their watchlist, favorites and lists. Charts such as \
+                 account can follow their watchlist, favorites, ratings, recommendations \
+                 and lists. Charts such as \
                  popular and top rated come from Scryer's metadata service instead."
                     .to_string(),
             ),
@@ -228,7 +246,19 @@ pub fn descriptor() -> PluginDescriptor {
                             SOURCE_PERSON,
                             vec![
                                 text_param(PARAM_PERSON_ID, "Person id"),
-                                enum_param(PARAM_CREDIT, "Credits", &["cast", "crew", "all"]),
+                                enum_param(
+                                    PARAM_CREDIT,
+                                    "Credits",
+                                    &[
+                                        "cast",
+                                        "crew",
+                                        "all",
+                                        "directing",
+                                        "production",
+                                        "sound",
+                                        "writing",
+                                    ],
+                                ),
                                 enum_param(PARAM_KIND, "Media", &["all", "movie", "series"]),
                             ],
                         ),
@@ -274,6 +304,22 @@ pub fn descriptor() -> PluginDescriptor {
                             "Movies and shows you marked as favorites on TMDb, newest first",
                             both(),
                             SOURCE_FAVORITES,
+                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
+                        )),
+                        personal(source_item(
+                            "rated",
+                            "Rated",
+                            "Movies and shows you rated on TMDb, newest first",
+                            both(),
+                            SOURCE_RATED,
+                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
+                        )),
+                        personal(source_item(
+                            "recommendations",
+                            "Recommendations",
+                            "Movies and shows TMDb recommends to you",
+                            both(),
+                            SOURCE_RECOMMENDATIONS,
                             vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
                         )),
                         personal(source_item(
@@ -612,14 +658,18 @@ impl<H: ListHttp> Client<'_, H> {
             }
             SOURCE_WATCHLIST => self.fetch_account_titles(request, "watchlist").await,
             SOURCE_FAVORITES => self.fetch_account_titles(request, "favorites").await,
+            SOURCE_RATED => self.fetch_account_titles(request, "rated").await,
+            SOURCE_RECOMMENDATIONS => self.fetch_account_titles(request, "recommendations").await,
             SOURCE_ACCOUNT_LIST => self.fetch_account_list(request).await,
             other => Err(unsupported_source(other)),
         }
     }
 
-    /// The member's watchlist or favorites (`collection`), newest first.
-    /// Following both kinds reads movies, then shows, each capped at half the
-    /// pages. A collection past its cap fails rather than being cut short.
+    /// The member's watchlist, favorites, rated titles or recommendations
+    /// (`collection`). Recommendations come in TMDb's order, which takes no
+    /// sort; the rest newest first. Following both kinds reads movies, then
+    /// shows, each capped at half the pages. A collection past its cap fails
+    /// rather than being cut short.
     async fn fetch_account_titles(
         &self,
         request: &ListPluginFetchRequest,
@@ -632,11 +682,16 @@ impl<H: ListHttp> Client<'_, H> {
             ListMediaKind::Series => "tv",
             _ => "movie",
         };
+        let sort = if collection == "recommendations" {
+            ""
+        } else {
+            "sort_by=created_at.desc&"
+        };
         let body = self
             .get_member_json(
                 member,
                 &format!(
-                    "{}/{endpoint}/{collection}?sort_by=created_at.desc&page={}",
+                    "{}/{endpoint}/{collection}?{sort}page={}",
                     member.account_path(),
                     position.page
                 ),
@@ -649,7 +704,7 @@ impl<H: ListHttp> Client<'_, H> {
         } else {
             MAX_PAGES
         };
-        within_member_cap(&body, max_pages, &format!("TMDb {collection}"))?;
+        within_cap(&body, max_pages, &format!("TMDb {collection}"))?;
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -718,7 +773,7 @@ impl<H: ListHttp> Client<'_, H> {
                 MemberRead::ListById,
             )
             .await?;
-        within_member_cap(&body, MAX_PAGES, "TMDb list")?;
+        within_cap(&body, MAX_PAGES, "TMDb list")?;
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -818,6 +873,7 @@ impl<H: ListHttp> Client<'_, H> {
                 &format!("TMDb list {list_id}"),
             )
             .await?;
+        within_cap(&body, MAX_PAGES, "TMDb list")?;
         let entries = body
             .get("items")
             .or_else(|| body.get("results"))
@@ -843,16 +899,21 @@ impl<H: ListHttp> Client<'_, H> {
         request: &ListPluginFetchRequest,
     ) -> Result<ListPluginFetchResponse, PluginError> {
         let person_id = required_id(request, PARAM_PERSON_ID)?;
-        let credit = match request
+        // The credit sections to read, and for crew a single department to
+        // keep.
+        let (credit, department) = match request
             .params
             .get(PARAM_CREDIT)
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
-            None | Some("") | Some("cast") => &["cast"][..],
-            Some("crew") => &["crew"][..],
-            Some("all") => &["cast", "crew"][..],
-            Some(other) => return Err(invalid_config(format!("unknown credit type {other}"))),
+            None | Some("") | Some("cast") => (&["cast"][..], None),
+            Some("crew") => (&["crew"][..], None),
+            Some("all") => (&["cast", "crew"][..], None),
+            Some(other) => match CREW_DEPARTMENTS.iter().find(|(option, _)| *option == other) {
+                Some((_, department)) => (&["crew"][..], Some(*department)),
+                None => return Err(invalid_config(format!("unknown credit type {other}"))),
+            },
         };
         let kinds = KindFilter::parse(request.params.get(PARAM_KIND), KindFilter::All, true)?;
         let body = self
@@ -871,6 +932,11 @@ impl<H: ListHttp> Client<'_, H> {
             })
             .flatten()
             .filter(|entry| !is_appearance(entry))
+            .filter(|entry| {
+                department.is_none_or(|department| {
+                    entry.get("department").and_then(Value::as_str) == Some(department)
+                })
+            })
             .collect();
         // Newest first, then by id, so the order is stable between syncs.
         entries.sort_by(|left, right| {
@@ -915,6 +981,7 @@ impl<H: ListHttp> Client<'_, H> {
                 &format!("TMDb {site_path} {id}"),
             )
             .await?;
+        within_cap(&body, MAX_PAGES, &format!("TMDb {site_path}"))?;
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -1000,9 +1067,9 @@ fn total_pages(body: &Value) -> u32 {
         .unwrap_or(1)
 }
 
-/// A member's own list past `max_pages` fails rather than being cut short:
-/// the host would read every title after the cap as having left the list.
-fn within_member_cap(body: &Value, max_pages: u32, what: &str) -> Result<(), PluginError> {
+/// A source past `max_pages` fails rather than being cut short: the host
+/// would read every title after the cap as having left the list.
+fn within_cap(body: &Value, max_pages: u32, what: &str) -> Result<(), PluginError> {
     if total_pages(body) > max_pages {
         return Err(permanent(format!(
             "the {what} has more than {} titles, more than Scryer follows",

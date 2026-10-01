@@ -342,8 +342,74 @@ fn person_credits_are_filtered_sorted_and_fingerprinted() {
 }
 
 #[test]
+fn person_crew_narrows_to_one_department() {
+    let body = r#"{
+      "id": 4401, "name": "Fixture Filmmaker",
+      "combined_credits": {
+        "cast": [
+          {"id": 990311, "media_type": "movie", "title": "Fixture Cameo", "release_date": "2024-01-01"}
+        ],
+        "crew": [
+          {"id": 990312, "media_type": "movie", "title": "Fixture Directed", "release_date": "2026-01-01", "department": "Directing", "job": "Director"},
+          {"id": 990313, "media_type": "movie", "title": "Fixture Produced", "release_date": "2025-01-01", "department": "Production", "job": "Producer"},
+          {"id": 990314, "media_type": "movie", "title": "Fixture Thanked", "release_date": "2023-01-01", "department": "Crew", "job": "Thanks"},
+          {"id": 990315, "media_type": "tv", "name": "Fixture Written Serial", "first_air_date": "2022-01-01", "department": "Writing", "job": "Writer", "genre_ids": [18]}
+        ]
+      }
+    }"#;
+    let http = RecordedHttp::new().with(
+        &url("/person/4401?append_to_response=combined_credits"),
+        200,
+        body,
+    );
+    let keys = |credit: &str| -> Vec<String> {
+        ok(fetch(
+            &http,
+            Some(KEY),
+            request("person", &[("person_id", "4401"), ("credit", credit)], None),
+        ))
+        .items
+        .into_iter()
+        .map(|item| item.item_key)
+        .collect()
+    };
+    assert_eq!(keys("directing"), vec!["tmdb:movie:990312"]);
+    assert_eq!(keys("production"), vec!["tmdb:movie:990313"]);
+    assert_eq!(keys("Writing"), vec!["tmdb:series:990315"]);
+    assert!(keys("sound").is_empty());
+    assert_eq!(
+        keys("crew"),
+        vec![
+            "tmdb:movie:990312",
+            "tmdb:movie:990313",
+            "tmdb:movie:990314",
+            "tmdb:series:990315"
+        ],
+        "crew keeps every department"
+    );
+    let person = descriptor().list_provider().cloned().unwrap().groups[0].items[1].clone();
+    let credit = person
+        .params
+        .iter()
+        .find(|param| param.key == PARAM_CREDIT)
+        .unwrap();
+    assert_eq!(
+        credit.options,
+        vec![
+            "cast",
+            "crew",
+            "all",
+            "directing",
+            "production",
+            "sound",
+            "writing"
+        ]
+    );
+}
+
+#[test]
 fn company_and_keyword_use_discover_with_a_page_cap() {
-    let body = r#"{"page": 50, "total_pages": 500, "total_results": 10000,
+    let body = r#"{"page": 50, "total_pages": 50, "total_results": 1000,
       "results": [{"id": 990401, "name": "Fixture Company Serial", "first_air_date": "2033-01-01"}]}"#;
     let http = RecordedHttp::new()
         .with(&url("/discover/tv?with_companies=77&sort_by=first_air_date.desc&include_adult=false&page=50"), 200, body)
@@ -383,6 +449,30 @@ fn company_and_keyword_use_discover_with_a_page_cap() {
 }
 
 #[test]
+fn public_sources_past_the_page_cap_fail_instead_of_being_cut_short() {
+    let oversized = format!(
+        r#"{{"page": 1, "total_pages": {}, "total_results": 8403, "items": [], "results": []}}"#,
+        MAX_PAGES + 1
+    );
+    let http = RecordedHttp::new()
+        .with(&url("/list/8100001?page=1"), 200, &oversized)
+        .with(
+            &url("/discover/movie?with_keywords=9951&sort_by=primary_release_date.desc&include_adult=false&page=1"),
+            200,
+            &oversized,
+        );
+    for request in [
+        request("list", &[("list_id", "8100001")], None),
+        request("keyword", &[("keyword_id", "9951")], None),
+    ] {
+        let error = err(fetch(&http, Some(KEY), request));
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(error.public_message.contains("1000 titles"));
+    }
+    assert_eq!(http.requests().len(), 2, "one page read per source");
+}
+
+#[test]
 fn errors_map_to_host_failure_classes() {
     let list = |status: u16, headers: &[(&str, &str)], body: &str| {
         let http =
@@ -399,6 +489,12 @@ fn errors_map_to_host_failure_classes() {
         r#"{"status_code": 7, "status_message": "Invalid API key"}"#,
     );
     assert_eq!(bad_key.code, PluginErrorCode::AuthFailed);
+    let bad_token = list(
+        401,
+        &[],
+        r#"{"status_code": 35, "status_message": "Invalid token."}"#,
+    );
+    assert_eq!(bad_token.code, PluginErrorCode::AuthFailed);
     let private = list(
         401,
         &[],
@@ -554,7 +650,16 @@ fn personal_sources_form_their_own_member_group() {
         .iter()
         .map(|item| item.source_type.as_str())
         .collect();
-    assert_eq!(sources, vec!["watchlist", "favorites", "account_list"]);
+    assert_eq!(
+        sources,
+        vec![
+            "watchlist",
+            "favorites",
+            "rated",
+            "recommendations",
+            "account_list"
+        ]
+    );
     for item in &mine.items {
         assert!(item.personal);
         assert_eq!(item.default_interval_seconds, 12 * 60 * 60);
@@ -563,7 +668,7 @@ fn personal_sources_form_their_own_member_group() {
             vec![ListMediaKind::Movie, ListMediaKind::Series]
         );
     }
-    for item in &mine.items[..2] {
+    for item in &mine.items[..4] {
         let [kind] = &item.params[..] else {
             panic!("{} takes only a media kind", item.id);
         };
@@ -571,7 +676,7 @@ fn personal_sources_form_their_own_member_group() {
         assert!(!kind.required);
         assert_eq!(kind.options, vec!["all", "movie", "series"]);
     }
-    let [list_id] = &mine.items[2].params[..] else {
+    let [list_id] = &mine.items[4].params[..] else {
         panic!("an account list takes only its id");
     };
     assert_eq!(list_id.key, PARAM_LIST_ID);
@@ -751,6 +856,38 @@ fn favorites_page_one_kind_by_number() {
     ));
     assert!(none.items.is_empty());
     assert_eq!(none.next_cursor.as_deref(), Some("series:1:0"));
+}
+
+#[test]
+fn rated_sorts_newest_first_and_recommendations_take_tmdbs_order() {
+    let page = r#"{"page": 1, "total_pages": 1, "total_results": 1, "results": [
+      {"id": 990701, "title": "Fixture Rated Feature", "release_date": "2027-07-07",
+       "account_rating": {"created_at": "2030-01-01T00:00:00.000Z", "value": 4}}
+    ]}"#;
+    let rated = account_url("/tv/rated?sort_by=created_at.desc&page=1");
+    let recommended = account_url("/movie/recommendations?page=1");
+    let http = RecordedHttp::new()
+        .with(&rated, 200, page)
+        .with(&recommended, 200, page);
+
+    let shows = ok(fetch(
+        &http,
+        None,
+        personal_request("rated", &[("kind", "series")], None),
+    ));
+    assert_eq!(shows.items[0].item_key, "tmdb:series:990701");
+    assert!(shows.next_cursor.is_none());
+
+    let movies = ok(fetch(
+        &http,
+        None,
+        personal_request("recommendations", &[("kind", "movie")], None),
+    ));
+    assert_eq!(movies.items[0].item_key, "tmdb:movie:990701");
+
+    let sent = http.requests();
+    assert_member_call(&sent[0], &rated);
+    assert_member_call(&sent[1], &recommended);
 }
 
 #[test]
