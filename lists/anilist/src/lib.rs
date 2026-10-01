@@ -70,8 +70,7 @@ pub const COLLECTION_CAP: u32 = 11_000;
 /// The chunks a capped collection fills, far below the host's hundred pages
 /// per sync.
 pub const MAX_CHUNKS: u32 = COLLECTION_CAP / PER_CHUNK;
-/// Twelve hours: a member's lists change slowly, and AniList asks clients to
-/// keep their request volume low.
+/// Twelve hours, Sonarr's shortest refresh for an AniList list.
 const DEFAULT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// AniList allows 30 requests a minute while its rate limit is degraded
 /// (90 otherwise), so the host spaces requests two seconds apart.

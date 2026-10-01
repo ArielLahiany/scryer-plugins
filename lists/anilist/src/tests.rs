@@ -883,7 +883,16 @@ fn graphql_errors_map_to_host_classes_even_with_http_200() {
             false,
         ),
         (404, "Not Found.", 404, PluginErrorCode::Permanent, true),
+        (404, "User not found", 404, PluginErrorCode::Permanent, true),
+        (404, "Private User", 404, PluginErrorCode::Permanent, true),
         (200, "User not found", 404, PluginErrorCode::Permanent, true),
+        (
+            403,
+            "The AniList API has been temporarily disabled due to severe stability issues.",
+            403,
+            PluginErrorCode::UpstreamUnavailable,
+            false,
+        ),
         (
             400,
             "Cannot query field \"fixtureField\" on type \"MediaList\".",
