@@ -617,9 +617,9 @@ impl<H: ListHttp> Client<'_, H> {
         }
     }
 
-    /// The member's watchlist or favorites (`collection`), newest first so
-    /// the page cap drops the oldest titles rather than the latest. Following
-    /// both kinds reads movies, then shows, each capped at half the pages.
+    /// The member's watchlist or favorites (`collection`), newest first.
+    /// Following both kinds reads movies, then shows, each capped at half the
+    /// pages. A collection past its cap fails rather than being cut short.
     async fn fetch_account_titles(
         &self,
         request: &ListPluginFetchRequest,
@@ -644,6 +644,12 @@ impl<H: ListHttp> Client<'_, H> {
                 MemberRead::Account,
             )
             .await?;
+        let max_pages = if kinds == KindFilter::All {
+            MAX_PAGES / 2
+        } else {
+            MAX_PAGES
+        };
+        within_member_cap(&body, max_pages, &format!("TMDb {collection}"))?;
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -712,6 +718,7 @@ impl<H: ListHttp> Client<'_, H> {
                 MemberRead::ListById,
             )
             .await?;
+        within_member_cap(&body, MAX_PAGES, "TMDb list")?;
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -991,6 +998,18 @@ fn total_pages(body: &Value) -> u32 {
         .and_then(Value::as_u64)
         .map(|pages| pages.min(u64::from(u32::MAX)) as u32)
         .unwrap_or(1)
+}
+
+/// A member's own list past `max_pages` fails rather than being cut short:
+/// the host would read every title after the cap as having left the list.
+fn within_member_cap(body: &Value, max_pages: u32, what: &str) -> Result<(), PluginError> {
+    if total_pages(body) > max_pages {
+        return Err(permanent(format!(
+            "the {what} has more than {} titles, more than Scryer follows",
+            max_pages * PAGE_SIZE
+        )));
+    }
+    Ok(())
 }
 
 fn paged(

@@ -677,7 +677,7 @@ fn watchlist_pages_movies_then_shows_with_the_member_token() {
 
 #[test]
 fn favorites_page_one_kind_by_number() {
-    let shows = r#"{"page": 1, "total_pages": 80, "total_results": 1600, "results": [
+    let shows = r#"{"page": 1, "total_pages": 50, "total_results": 1000, "results": [
       {"id": 990611, "name": "Fixture Favorite Serial", "first_air_date": "2028-03-03"}
     ]}"#;
     let page = |page| {
@@ -712,6 +712,31 @@ fn favorites_page_one_kind_by_number() {
     );
     assert_eq!(last.items[0].rank, Some(981));
     assert_member_call(&http.requests()[0], &page(1));
+
+    // Past the cap the collection fails rather than being cut short, which
+    // would read as its oldest titles leaving it. With both kinds each side
+    // gets half the pages.
+    let oversized = |pages: u32| {
+        format!(r#"{{"page": 1, "total_pages": {pages}, "total_results": 9999, "results": []}}"#)
+    };
+    let too_long = RecordedHttp::new().with(&page(1), 200, &oversized(MAX_PAGES + 1));
+    let error = err(fetch(
+        &too_long,
+        None,
+        personal_request("favorites", &[("kind", "series")], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    let too_long_for_half = RecordedHttp::new().with(
+        &account_url("/movie/favorites?sort_by=created_at.desc&page=1"),
+        200,
+        &oversized(MAX_PAGES / 2 + 1),
+    );
+    let error = err(fetch(
+        &too_long_for_half,
+        None,
+        personal_request("favorites", &[], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
 
     // With both kinds, an empty movie side hands straight over to shows.
     let empty = RecordedHttp::new().with(
