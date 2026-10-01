@@ -6,10 +6,14 @@ use scryer_plugin_sdk::{
     ListMediaKind, ListPluginFetchRequest, ListPluginHealthRequest, PluginDescriptor,
     PluginErrorCode, PluginResult,
 };
+use serde_json::json;
 
 use super::*;
 
 const FEED_URL: &str = "https://rss.plex.tv/0f1e2d3c-fixture-feed";
+const TOKEN: &str = "fixture-plex-token-0001";
+/// 2030-06-15 12:00 UTC.
+const NOW_MS: u64 = 22_080 * MILLIS_PER_DAY + 12 * 60 * 60 * 1000;
 
 const WATCHLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
@@ -77,12 +81,77 @@ fn descriptor_round_trips_and_passes_host_checks() {
 
     let list = list_descriptor();
     assert_eq!(list.provider_type, "plex");
-    assert_eq!(list.auth, ListProviderAuth::None);
-    assert!(!list.capabilities.requires_member_credential);
-    assert_eq!(list.allowed_hosts, vec!["rss.plex.tv".to_string()]);
+    assert_eq!(
+        list.auth,
+        ListProviderAuth::MemberAccount {
+            flow: ListAccountFlow::PlexPin,
+            exchange: ListAccountExchange::Direct,
+            byo_app: false,
+            scopes: Vec::new(),
+        }
+    );
+    assert!(list.capabilities.account);
+    assert!(!list.capabilities.health);
+    assert!(
+        !list.capabilities.requires_member_credential,
+        "the RSS source must keep working with no account"
+    );
+    assert_eq!(
+        list.allowed_hosts,
+        vec![
+            "rss.plex.tv".to_string(),
+            "discover.provider.plex.tv".to_string(),
+            "plex.tv".to_string()
+        ]
+    );
     assert!(
         list.config_fields.is_empty(),
         "no credential may live in plugin config"
+    );
+}
+
+#[test]
+fn only_the_account_group_is_personal() {
+    let list = list_descriptor();
+    let items: Vec<_> = list
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .items
+                .iter()
+                .map(move |item| (group.auth_badge, item.clone()))
+        })
+        .collect();
+    assert_eq!(items.len(), 2);
+    for (badge, item) in &items {
+        assert_eq!(
+            item.personal,
+            *badge == ListAuthBadge::MemberAccount,
+            "{}",
+            item.id
+        );
+        assert_eq!(item.default_interval_seconds, 6 * 60 * 60, "{}", item.id);
+    }
+
+    let (rss_badge, rss) = &items[0];
+    assert_eq!(*rss_badge, ListAuthBadge::NoAccountNeedsValue);
+    assert_eq!(rss.source_type, SOURCE_WATCHLIST_RSS);
+    assert!(!rss.personal);
+    assert_eq!(rss.params.len(), 1);
+
+    let (own_badge, own) = &items[1];
+    assert_eq!(*own_badge, ListAuthBadge::MemberAccount);
+    assert_eq!(own.source_type, SOURCE_WATCHLIST);
+    assert!(own.personal);
+    assert!(own.params.is_empty());
+    assert_eq!(own.kinds, vec![ListMediaKind::Movie, ListMediaKind::Series]);
+
+    assert!(
+        list.url_patterns
+            .iter()
+            .all(|pattern| pattern.source_type == SOURCE_WATCHLIST_RSS),
+        "a pasted URL may only ever create the public source"
     );
 }
 
@@ -225,4 +294,539 @@ fn unknown_sources_and_other_commands_are_unsupported() {
         }
         other => panic!("unexpected {other:?}"),
     }
+}
+
+fn credential(token: &str) -> ListCredential {
+    ListCredential {
+        access_token: token.to_string(),
+        token_type: None,
+        external_user_id: Some("990001".to_string()),
+        username: Some("fixture_member".to_string()),
+    }
+}
+
+fn watchlist_request(token: Option<&str>, cursor: Option<&str>) -> ListPluginFetchRequest {
+    ListPluginFetchRequest {
+        source_type: SOURCE_WATCHLIST.to_string(),
+        params: BTreeMap::new(),
+        credential: token.map(credential),
+        page_cursor: cursor.map(str::to_string),
+        since_fingerprint: None,
+    }
+}
+
+fn watchlist_url(offset: u32) -> String {
+    format!(
+        "https://discover.provider.plex.tv/library/sections/watchlist/all?includeGuids=1\
+         &excludeElements=Image&sort=watchlistedAt%3Adesc\
+         &X-Plex-Container-Start={offset}&X-Plex-Container-Size=100"
+    )
+}
+
+fn container(offset: u32, total: Option<u64>, entries: Vec<Value>) -> String {
+    let mut container = json!({
+        "offset": offset,
+        "size": entries.len(),
+        "identifier": "tv.plex.provider.discover",
+        "Metadata": entries,
+    });
+    if let Some(total) = total {
+        container["totalSize"] = json!(total);
+    }
+    json!({ "MediaContainer": container }).to_string()
+}
+
+fn movie(n: u32) -> Value {
+    json!({
+        "ratingKey": format!("fixture{n:04}"),
+        "type": "movie",
+        "title": format!("Fixture Feature {n}"),
+        "year": 2020,
+        "Guid": [{ "id": format!("tmdb://99{n:04}") }],
+    })
+}
+
+/// The same two titles as the RSS fixture, plus one Plex knows only by its
+/// own guid.
+fn own_watchlist() -> String {
+    container(
+        0,
+        Some(3),
+        vec![
+            json!({
+                "ratingKey": "fixture0101",
+                "guid": "plex://movie/fixture0101",
+                "type": "movie",
+                "title": "Fixture Feature One",
+                "year": 2035,
+                "originallyAvailableAt": "2035-01-01",
+                "Guid": [
+                    { "id": "imdb://tt9900101" },
+                    { "id": "tmdb://990101" },
+                    { "id": "tvdb://770101" }
+                ]
+            }),
+            json!({
+                "ratingKey": "fixture0102",
+                "guid": "plex://show/fixture0102",
+                "type": "show",
+                "title": "Fixture Serial Two",
+                "year": 2021,
+                "originallyAvailableAt": "2021-03-04",
+                "Guid": [
+                    { "id": "tvdb://880102" },
+                    { "id": "imdb://tt9900102" }
+                ]
+            }),
+            json!({
+                "ratingKey": "fixture0103",
+                "guid": "plex://movie/fixture0103",
+                "type": "movie",
+                "title": "Fixture Without Ids",
+                "Guid": [{ "id": "plex://movie/fixture0103" }]
+            }),
+        ],
+    )
+}
+
+fn token_header(request: &PluginHttpRequest) -> Option<&str> {
+    request
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(TOKEN_HEADER))
+        .map(|(_, value)| value.as_str())
+}
+
+#[test]
+fn own_watchlist_reads_with_the_token_header_and_matches_rss_keys() {
+    let http = RecordedHttp::new().with(&watchlist_url(0), 200, &own_watchlist());
+    let response = block_on(fetch_at(
+        &http,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap();
+
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, watchlist_url(0));
+    assert_eq!(requests[0].method.as_deref(), Some("GET"));
+    assert_eq!(token_header(&requests[0]), Some(TOKEN));
+    assert_eq!(
+        requests[0].headers.get("Accept").map(String::as_str),
+        Some("application/json")
+    );
+    assert!(!requests[0].url.contains(TOKEN));
+    assert!(!requests[0].url.contains("X-Plex-Token"));
+
+    assert!(response.next_cursor.is_none());
+    assert!(response.fingerprint.is_none());
+    assert!(!response.unchanged);
+    assert_eq!(response.total_hint, Some(3));
+    assert_eq!(response.items.len(), 2);
+
+    let movie = &response.items[0];
+    assert_eq!(movie.rank, Some(1));
+    assert_eq!(movie.kind_hint, Some(ListMediaKind::Movie));
+    assert_eq!(movie.title.as_deref(), Some("Fixture Feature One"));
+    assert_eq!(movie.year, Some(2035));
+    let sources: Vec<_> = movie
+        .external_ids
+        .iter()
+        .map(|id| (id.source.as_str(), id.id.as_str(), id.kind.as_deref()))
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            ("tmdb", "990101", Some("movie")),
+            ("imdb", "tt9900101", Some("movie")),
+            ("tvdb", "770101", Some("movie"))
+        ]
+    );
+    let show = &response.items[1];
+    assert_eq!(show.rank, Some(2));
+    assert_eq!(show.kind_hint, Some(ListMediaKind::Series));
+
+    let feed_http = RecordedHttp::new().with(FEED_URL, 200, WATCHLIST);
+    let feed = block_on(fetch(&feed_http, &request(FEED_URL, None))).unwrap();
+    let keys = |items: &[ListPluginItem]| -> Vec<String> {
+        items.iter().map(|item| item.item_key.clone()).collect()
+    };
+    assert_eq!(keys(&response.items), keys(&feed.items));
+    assert_eq!(
+        keys(&response.items),
+        vec![
+            "tmdb:movie:990101".to_string(),
+            "imdb:tt9900102".to_string()
+        ]
+    );
+}
+
+#[test]
+fn the_public_feed_never_receives_the_member_token() {
+    let http = RecordedHttp::new().with(FEED_URL, 200, WATCHLIST);
+    let with_credential = ListPluginFetchRequest {
+        credential: Some(credential(TOKEN)),
+        ..request(FEED_URL, None)
+    };
+    block_on(fetch_at(&http, &with_credential, NOW_MS)).unwrap();
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, FEED_URL);
+    assert_eq!(token_header(&requests[0]), None);
+    assert!(
+        requests[0]
+            .headers
+            .values()
+            .all(|value| !value.contains(TOKEN))
+    );
+}
+
+#[test]
+fn watchlist_pages_by_container_offset() {
+    // Plex answered with fewer titles than asked: the next page starts where
+    // this one ended, and ranks continue from the offset.
+    let http = RecordedHttp::new()
+        .with(
+            &watchlist_url(0),
+            200,
+            &container(0, Some(5), (1..=3).map(movie).collect()),
+        )
+        .with(
+            &watchlist_url(3),
+            200,
+            &container(3, Some(5), (4..=5).map(movie).collect()),
+        );
+    let first = block_on(fetch_at(
+        &http,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert_eq!(first.next_cursor.as_deref(), Some("1:3"));
+    assert_eq!(first.total_hint, Some(5));
+    assert!(first.fingerprint.is_none());
+    let ranks: Vec<_> = first.items.iter().map(|item| item.rank).collect();
+    assert_eq!(ranks, vec![Some(1), Some(2), Some(3)]);
+
+    let second = block_on(fetch_at(
+        &http,
+        &watchlist_request(Some(TOKEN), first.next_cursor.as_deref()),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert!(second.next_cursor.is_none());
+    let keyed: Vec<_> = second
+        .items
+        .iter()
+        .map(|item| (item.item_key.as_str(), item.rank))
+        .collect();
+    assert_eq!(
+        keyed,
+        vec![
+            ("tmdb:movie:990004", Some(4)),
+            ("tmdb:movie:990005", Some(5))
+        ]
+    );
+    assert_eq!(http.urls(), vec![watchlist_url(0), watchlist_url(3)]);
+    assert!(
+        http.requests()
+            .iter()
+            .all(|request| token_header(request) == Some(TOKEN))
+    );
+}
+
+#[test]
+fn watchlist_paging_without_a_total_and_at_the_cap() {
+    // No total anywhere: a full page means there may be more.
+    let full = RecordedHttp::new().with(
+        &watchlist_url(0),
+        200,
+        &container(0, None, (1..=100).map(movie).collect()),
+    );
+    let response = block_on(fetch_at(
+        &full,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert_eq!(response.next_cursor.as_deref(), Some("1:100"));
+    assert_eq!(response.total_hint, None);
+
+    // The total can come from the container header instead.
+    let header_total = RecordedHttp::new().with_headers(
+        &watchlist_url(0),
+        200,
+        &[("X-Plex-Container-Total-Size", "2")],
+        &container(0, None, (1..=2).map(movie).collect()),
+    );
+    let response = block_on(fetch_at(
+        &header_total,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert!(response.next_cursor.is_none());
+    assert_eq!(response.total_hint, Some(2));
+
+    // The last allowed request ends the sync however much Plex still holds.
+    let last = RecordedHttp::new().with(
+        &watchlist_url(1900),
+        200,
+        &container(1900, Some(9000), (1..=100).map(movie).collect()),
+    );
+    let response = block_on(fetch_at(
+        &last,
+        &watchlist_request(Some(TOKEN), Some("19:1900")),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert!(response.next_cursor.is_none());
+    assert_eq!(response.total_hint, Some(MAX_PAGES * PAGE_SIZE));
+    assert_eq!(response.items[0].rank, Some(1901));
+
+    for cursor in ["20:2000", "7", "a:b", "1:-3"] {
+        let http = RecordedHttp::new();
+        let error = block_on(fetch_at(
+            &http,
+            &watchlist_request(Some(TOKEN), Some(cursor)),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{cursor}");
+        assert!(http.urls().is_empty(), "{cursor}");
+    }
+}
+
+#[test]
+fn released_follows_the_first_release_date_against_the_clock() {
+    let entry = |n: u32, date: Option<&str>, year: Option<i32>| {
+        let mut entry = movie(n);
+        entry["year"] = json!(year);
+        if let Some(date) = date {
+            entry["originallyAvailableAt"] = json!(date);
+        }
+        entry
+    };
+    let body = container(
+        0,
+        Some(8),
+        vec![
+            entry(1, Some("2030-06-15"), Some(2030)),
+            entry(2, Some("2030-06-16"), Some(2030)),
+            entry(3, Some("2019-11-02"), Some(2019)),
+            entry(4, None, Some(2029)),
+            entry(5, None, Some(2031)),
+            entry(6, None, Some(2030)),
+            entry(7, None, None),
+            entry(8, Some("not a date"), Some(2001)),
+        ],
+    );
+    let http = RecordedHttp::new().with(&watchlist_url(0), 200, &body);
+    let released: Vec<_> = block_on(fetch_at(
+        &http,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap()
+    .items
+    .iter()
+    .map(|item| item.released)
+    .collect();
+    assert_eq!(
+        released,
+        vec![
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            Some(true)
+        ]
+    );
+
+    // An unknown clock decides nothing.
+    let unknown = block_on(fetch_at(&http, &watchlist_request(Some(TOKEN), None), 0)).unwrap();
+    assert!(unknown.items.iter().all(|item| item.released.is_none()));
+    // Plex lists no streaming services here, so nothing is claimed.
+    assert!(
+        unknown
+            .items
+            .iter()
+            .all(|item| item.available_on.is_empty())
+    );
+}
+
+#[test]
+fn calendar_days_count_from_the_unix_epoch() {
+    assert_eq!(days_from_civil(1970, 1, 1), 0);
+    assert_eq!(days_from_civil(1969, 12, 31), -1);
+    assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    assert_eq!(days_from_civil(2030, 6, 15), 22_080);
+    assert_eq!(epoch_day("2030-06-15"), Some(22_080));
+    assert_eq!(epoch_day("2030-06-15T00:00:00Z"), Some(22_080));
+    assert_eq!(epoch_day("2030-13-01"), None);
+    assert_eq!(epoch_day("2030"), None);
+    assert_eq!(today(NOW_MS), Some(22_080));
+    assert_eq!(today(0), None);
+}
+
+const ACCOUNT_BODY: &str = r#"{
+  "user": {
+    "id": 990001,
+    "uuid": "fixture-uuid-0001",
+    "username": "fixture_member",
+    "title": "Fixture Member",
+    "email": "fixture.member@example.test",
+    "thumb": "https://images.example.test/fixture-member.png",
+    "authToken": "fixture-echoed-token"
+  }
+}"#;
+
+fn account_request(token: &str) -> ListPluginAccountRequest {
+    ListPluginAccountRequest {
+        credential: credential(token),
+    }
+}
+
+#[test]
+fn account_reads_the_plex_identity_through_the_header() {
+    let http = RecordedHttp::new().with(ACCOUNT_URL, 200, ACCOUNT_BODY);
+    let result = block_on(run(
+        &http,
+        PluginListCommand::Account(account_request(TOKEN)),
+    ));
+    let account = match result {
+        PluginListCommandResult::Account(PluginResult::Ok(account)) => account,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(account.external_user_id, "990001");
+    assert_eq!(account.username, "fixture_member");
+    assert_eq!(account.display_name.as_deref(), Some("Fixture Member"));
+    assert_eq!(
+        account.avatar_url.as_deref(),
+        Some("https://images.example.test/fixture-member.png")
+    );
+    assert!(account.owned_lists.is_empty());
+    assert!(account.statuses.is_empty());
+    let serialized = serde_json::to_string(&account).unwrap();
+    assert!(!serialized.contains("fixture.member@example.test"));
+    assert!(!serialized.contains("fixture-echoed-token"));
+
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "https://plex.tv/users/account.json");
+    assert_eq!(token_header(&requests[0]), Some(TOKEN));
+    assert!(!requests[0].url.contains(TOKEN));
+}
+
+#[test]
+fn account_falls_back_to_the_uuid_and_title() {
+    let body = r#"{"user": {"uuid": "fixture-uuid-0002", "title": "Fixture Home User"}}"#;
+    let http = RecordedHttp::new().with(ACCOUNT_URL, 200, body);
+    let identity = block_on(account(&http, &account_request(TOKEN))).unwrap();
+    assert_eq!(identity.external_user_id, "fixture-uuid-0002");
+    assert_eq!(identity.username, "Fixture Home User");
+    assert_eq!(identity.display_name.as_deref(), Some("Fixture Home User"));
+    assert_eq!(identity.avatar_url, None);
+
+    for body in [
+        r#"{"user": {"title": "No Id"}}"#,
+        r#"{"error": "x"}"#,
+        "<html/>",
+    ] {
+        let http = RecordedHttp::new().with(ACCOUNT_URL, 200, body);
+        let error = block_on(account(&http, &account_request(TOKEN))).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{body}");
+    }
+}
+
+#[test]
+fn a_rejected_token_marks_the_account_expired() {
+    for status in [401, 403] {
+        let watchlist = RecordedHttp::new().with(&watchlist_url(0), status, "");
+        let error = block_on(fetch_at(
+            &watchlist,
+            &watchlist_request(Some(TOKEN), None),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
+        assert!(!error.public_message.contains(TOKEN));
+        assert!(!error.public_message.contains("discover.provider"));
+        assert!(error.debug_message.is_none());
+
+        let account_http = RecordedHttp::new().with(ACCOUNT_URL, status, "");
+        let error = block_on(account(&account_http, &account_request(TOKEN))).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
+        assert!(!error.public_message.contains(TOKEN));
+    }
+}
+
+#[test]
+fn other_watchlist_failures_map_to_host_classes() {
+    let cases = [
+        (404, PluginErrorCode::Permanent),
+        (429, PluginErrorCode::RateLimited),
+        (502, PluginErrorCode::UpstreamUnavailable),
+    ];
+    for (status, code) in cases {
+        let http = RecordedHttp::new().with_headers(
+            &watchlist_url(0),
+            status,
+            &[("Retry-After", "90")],
+            "",
+        );
+        let error = block_on(fetch_at(
+            &http,
+            &watchlist_request(Some(TOKEN), None),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, code, "{status}");
+        // A moved service must not read as the member's list being gone.
+        assert!(!error.public_message.contains("not found"), "{status}");
+        assert!(!error.public_message.contains(TOKEN), "{status}");
+        if status == 429 {
+            assert_eq!(error.retry_after_seconds, Some(90));
+        }
+    }
+    for body in ["<html>sign in</html>", r#"{"Metadata": []}"#] {
+        let http = RecordedHttp::new().with(&watchlist_url(0), 200, body);
+        let error = block_on(fetch_at(
+            &http,
+            &watchlist_request(Some(TOKEN), None),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{body}");
+    }
+    // An empty watchlist is an empty list, not a failure.
+    let empty = RecordedHttp::new().with(
+        &watchlist_url(0),
+        200,
+        r#"{"MediaContainer": {"offset": 0, "size": 0, "totalSize": 0}}"#,
+    );
+    let response = block_on(fetch_at(
+        &empty,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert!(response.items.is_empty());
+    assert!(response.next_cursor.is_none());
+}
+
+#[test]
+fn a_personal_source_without_a_credential_fails_before_any_request() {
+    let http = RecordedHttp::new();
+    for token in [None, Some(""), Some("   ")] {
+        let error = block_on(fetch_at(&http, &watchlist_request(token, None), NOW_MS)).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{token:?}");
+    }
+    let error = block_on(account(&http, &account_request(" "))).unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert!(http.urls().is_empty());
 }
