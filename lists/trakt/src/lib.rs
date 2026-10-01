@@ -1,13 +1,16 @@
 //! Trakt list provider.
 //!
-//! Follows four kinds of Trakt sources:
+//! Follows six kinds of Trakt sources:
 //!
 //! - `user_list`: any public list a Trakt member made, by username and list
-//!   slug or id, from `/users/{user}/lists/{list}`.
+//!   name, slug or id, from `/users/{user}/lists/{list}`.
 //! - `list`: any public list by its numeric id, from `/lists/{id}`, which
 //!   also serves Trakt's official lists.
-//! - `watchlist`: the connected member's watchlist.
+//! - `watchlist`: the connected member's watchlist, in the order they pick.
 //! - `my_list`: one of the connected member's own lists, private ones too.
+//! - `watched`: the movies or the shows the connected member has watched.
+//! - `collection`: the movies or the shows in the connected member's
+//!   collection.
 //!
 //! Public sources are always read anonymously, so they keep working when a
 //! member's account link lapses. Personal sources send the member's bearer
@@ -23,7 +26,9 @@ use list_provider_common::error::{
     Access, auth_failed, check_status, invalid_config, missing_param, not_found, permanent,
     plugin_error, unsupported_source,
 };
-use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, header, json_body};
+use list_provider_common::http::{
+    HostHttp, ListHttp, body_text, encode_component, get, header, json_body,
+};
 use list_provider_common::ids::{
     Ids, build_item, dedupe_and_rank, json_id, json_text, json_year, kind_str, positive_id,
 };
@@ -61,10 +66,20 @@ pub const SOURCE_USER_LIST: &str = "user_list";
 pub const SOURCE_LIST: &str = "list";
 pub const SOURCE_WATCHLIST: &str = "watchlist";
 pub const SOURCE_MY_LIST: &str = "my_list";
+pub const SOURCE_WATCHED: &str = "watched";
+pub const SOURCE_COLLECTION: &str = "collection";
 
 pub const PARAM_USER: &str = "user";
 pub const PARAM_LIST: &str = "list";
 pub const PARAM_LIST_ID: &str = "list_id";
+pub const PARAM_SORT: &str = "sort";
+pub const PARAM_KIND: &str = "kind";
+
+/// The watchlist orders Sonarr and Radarr offer; Trakt's own order, `rank`,
+/// comes first and is the default.
+pub const WATCHLIST_SORTS: [&str; 4] = ["rank", "added", "title", "released"];
+/// The `{type}` path segment of Trakt's watched and collection endpoints.
+pub const KINDS: [&str; 2] = ["movies", "shows"];
 
 /// The external id source the metadata gateway resolves Trakt ids under.
 pub const SOURCE_TRAKT: &str = "trakt";
@@ -86,9 +101,10 @@ const ACCOUNT_LIST_LIMIT: u32 = 100;
 const MAX_ACCOUNT_LIST_PAGES: u32 = 10;
 /// Twelve hours, the interval the other arrs use for Trakt lists.
 const DEFAULT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
-/// One fetch every two seconds stays far below Trakt's 500 reads per five
-/// minutes even when a page also reads the list summary.
-const RATE_LIMIT_SECONDS: i64 = 2;
+/// Five seconds between fetches, the spacing Sonarr gives Trakt lists. Trakt
+/// allows 500 reads per five minutes, counted per app for anonymous reads
+/// and per member for signed-in ones.
+const RATE_LIMIT_SECONDS: i64 = 5;
 
 const NO_CLIENT_ID: &str = "this build of the Trakt plugin has no Trakt app client id, so it \
                             cannot reach Trakt yet";
@@ -100,6 +116,16 @@ fn text_param(key: &str, label: &str) -> ListSourceParam {
         param_type: ListSourceParamType::Text,
         options: Vec::new(),
         required: true,
+    }
+}
+
+fn enum_param(key: &str, label: &str, options: &[&str], required: bool) -> ListSourceParam {
+    ListSourceParam {
+        key: key.to_string(),
+        label: label.to_string(),
+        param_type: ListSourceParamType::Enum,
+        options: options.iter().map(|option| option.to_string()).collect(),
+        required,
     }
 }
 
@@ -179,7 +205,7 @@ pub fn descriptor() -> PluginDescriptor {
                             SOURCE_USER_LIST,
                             vec![
                                 text_param(PARAM_USER, "Username"),
-                                text_param(PARAM_LIST, "List slug or id"),
+                                text_param(PARAM_LIST, "List name, slug or id"),
                             ],
                             false,
                         ),
@@ -202,7 +228,7 @@ pub fn descriptor() -> PluginDescriptor {
                             "Watchlist",
                             "Movies and shows on your Trakt watchlist",
                             SOURCE_WATCHLIST,
-                            Vec::new(),
+                            vec![enum_param(PARAM_SORT, "Order", &WATCHLIST_SORTS, false)],
                             true,
                         ),
                         source_item(
@@ -211,6 +237,22 @@ pub fn descriptor() -> PluginDescriptor {
                             "One of your own Trakt lists, private ones included",
                             SOURCE_MY_LIST,
                             vec![text_param(PARAM_LIST, "List")],
+                            true,
+                        ),
+                        source_item(
+                            "watched",
+                            "Watched",
+                            "The movies or the shows you have watched on Trakt",
+                            SOURCE_WATCHED,
+                            vec![enum_param(PARAM_KIND, "Type", &KINDS, true)],
+                            true,
+                        ),
+                        source_item(
+                            "collection",
+                            "Collection",
+                            "The movies or the shows in your Trakt collection",
+                            SOURCE_COLLECTION,
+                            vec![enum_param(PARAM_KIND, "Type", &KINDS, true)],
                             true,
                         ),
                     ],
@@ -316,6 +358,67 @@ fn numeric_list_id(request: &ListPluginFetchRequest) -> Result<String, PluginErr
         .ok_or_else(|| invalid_config(format!("{PARAM_LIST_ID} must be a Trakt numeric list id")))
 }
 
+/// An enum parameter's value, or `default` when it is unset. The host checks
+/// the options as well; this keeps a stray value out of the request path.
+fn choice<'a>(
+    request: &ListPluginFetchRequest,
+    key: &str,
+    options: &[&'a str],
+    default: Option<&'a str>,
+) -> Result<&'a str, PluginError> {
+    match request
+        .params
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => options
+            .iter()
+            .copied()
+            .find(|option| *option == value)
+            .ok_or_else(|| invalid_config(format!("{key} must be one of {}", options.join(", ")))),
+        None => default.ok_or_else(|| missing_param(key)),
+    }
+}
+
+/// The list's slug from what was typed: its name, its slug or its numeric
+/// id. Trakt derives a slug from the name the way Radarr's `ToUrlSlug` does:
+/// lowercase, every character other than a letter, digit, `-` or `_` turns
+/// into `-`, runs of `-` collapse and leading and trailing ones go. A slug or
+/// an id comes through unchanged. Trakt also folds accented letters, which
+/// this plugin does not reproduce, so a name with letters outside A to Z
+/// needs the slug or id from the list's address instead. When an owner has
+/// two lists of the same name Trakt suffixes the later slug, so only its
+/// address or id reaches that one.
+fn list_slug(value: &str) -> Result<String, PluginError> {
+    const NEEDS_ADDRESS: &str = "use the Trakt list's address, slug or id for a name with letters \
+                                 outside A to Z";
+    if value
+        .chars()
+        .any(|character| !character.is_ascii() && character.is_alphanumeric())
+    {
+        return Err(invalid_config(NEEDS_ADDRESS));
+    }
+    let mut slug = String::with_capacity(value.len());
+    for character in value
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+    {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_' {
+            slug.push(character);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        return Err(invalid_config(NEEDS_ADDRESS));
+    }
+    Ok(slug)
+}
+
 fn member_token(credential: Option<&ListCredential>) -> Result<String, PluginError> {
     credential
         .map(|credential| credential.access_token.trim())
@@ -326,13 +429,14 @@ fn member_token(credential: Option<&ListCredential>) -> Result<String, PluginErr
 
 /// Lists carry seasons and episodes as well as movies and shows; each maps to
 /// its show. The watchlist endpoint for every type at once takes movies and
-/// shows only, in the member's own order.
+/// shows only, in the order the member picks. Watched and collection read
+/// one type at a time.
 fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
     const LIST_ITEMS: &str = "items/movie,show,season,episode";
     match request.source_type.as_str() {
         SOURCE_USER_LIST => {
             let user = required(request, PARAM_USER)?;
-            let list = required(request, PARAM_LIST)?;
+            let list = list_slug(&required(request, PARAM_LIST)?)?;
             let path = format!(
                 "/users/{}/lists/{}",
                 encode_component(&user),
@@ -356,15 +460,29 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
                 what: format!("Trakt list {id}"),
             })
         }
-        SOURCE_WATCHLIST => Ok(Target {
-            items_path: "/users/me/watchlist/movie,show/rank".to_string(),
-            summary_path: None,
-            site_url: None,
-            token: Some(member_token(request.credential.as_ref())?),
-            what: "Trakt watchlist".to_string(),
-        }),
+        SOURCE_WATCHLIST => {
+            let sort = choice(request, PARAM_SORT, &WATCHLIST_SORTS, Some("rank"))?;
+            Ok(Target {
+                items_path: format!("/users/me/watchlist/movie,show/{sort}"),
+                summary_path: None,
+                site_url: None,
+                token: Some(member_token(request.credential.as_ref())?),
+                what: "Trakt watchlist".to_string(),
+            })
+        }
+        SOURCE_WATCHED | SOURCE_COLLECTION => {
+            let kind = choice(request, PARAM_KIND, &KINDS, None)?;
+            let source = request.source_type.as_str();
+            Ok(Target {
+                items_path: format!("/users/me/{source}/{kind}"),
+                summary_path: None,
+                site_url: None,
+                token: Some(member_token(request.credential.as_ref())?),
+                what: format!("Trakt {source} {kind}"),
+            })
+        }
         SOURCE_MY_LIST => {
-            let list = required(request, PARAM_LIST)?;
+            let list = list_slug(&required(request, PARAM_LIST)?)?;
             let token = member_token(request.credential.as_ref())?;
             let path = format!("/users/me/lists/{}", encode_component(&list));
             Ok(Target {
@@ -428,7 +546,12 @@ impl<H: ListHttp> Client<'_, H> {
         if page == 1
             && let Some(path) = &target.summary_path
         {
-            let summary = json_body(&self.send(path, token, &target.what).await?)?;
+            let response = self.send(path, token, &target.what).await?;
+            // Trakt answers a list id that names no list with an empty 204.
+            if response.status == 204 {
+                return Err(not_found(format!("{} (HTTP 204)", target.what)));
+            }
+            let summary = json_body(&response)?;
             list_name = json_text(summary.get("name"));
             list_url = summary_url(&summary).or(list_url);
         }
@@ -559,7 +682,8 @@ impl<H: ListHttp> Client<'_, H> {
 
 /// Trakt's documented status codes onto the host's failure classes. A 401
 /// is a lapsed member token when one was sent, and a private list when the
-/// request was anonymous; a 403 is the app's client id itself.
+/// request was anonymous. Trakt answers a list that is private or gone with
+/// a 403 that says so; any other 403 rejects the app's client id.
 fn check_trakt_status(
     response: &PluginHttpResponse,
     authorized: bool,
@@ -570,6 +694,12 @@ fn check_trakt_status(
             "Trakt rejected the account token; reconnect the Trakt account",
         )),
         401 => Err(not_found(format!("{what} (private, HTTP 401)"))),
+        403 if body_text(response)
+            .to_ascii_lowercase()
+            .contains("private or does not exist") =>
+        {
+            Err(not_found(format!("{what} (private or deleted, HTTP 403)")))
+        }
         403 => Err(invalid_config(
             "Trakt rejected the plugin's app client id (HTTP 403)",
         )),
@@ -616,9 +746,16 @@ fn season_number(value: Option<&Value>, key: &str) -> Option<i32> {
 
 /// Map one listed entry. Movies and shows map directly; a season or an
 /// episode maps to its show and notes the season. People, and any type Trakt
-/// adds later, are skipped.
+/// adds later, are skipped. Watched entries carry no type, only the movie or
+/// the show.
 fn to_item(entry: &Value) -> Option<ListPluginItem> {
-    let (kind, media, season) = match entry.get("type").and_then(Value::as_str)? {
+    let entry_type = match entry.get("type").and_then(Value::as_str) {
+        Some(entry_type) => entry_type,
+        None if entry.get("movie").is_some() => "movie",
+        None if entry.get("show").is_some() => "show",
+        None => return None,
+    };
+    let (kind, media, season) = match entry_type {
         "movie" => (ListMediaKind::Movie, entry.get("movie")?, None),
         "show" => (ListMediaKind::Series, entry.get("show")?, None),
         "season" => (

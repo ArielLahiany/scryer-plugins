@@ -202,7 +202,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
     assert!(!list.capabilities.requires_member_credential);
     assert!(list.config_fields.is_empty());
     assert_eq!(list.allowed_hosts, vec!["api.trakt.tv".to_string()]);
-    assert_eq!(list.rate_limit_seconds, Some(2));
+    assert_eq!(list.rate_limit_seconds, Some(5));
 
     let sources: Vec<_> = list
         .groups
@@ -217,6 +217,36 @@ fn descriptor_round_trips_and_passes_host_checks() {
             ("list", false),
             ("watchlist", true),
             ("my_list", true),
+            ("watched", true),
+            ("collection", true),
+        ]
+    );
+    let enums: Vec<_> = list
+        .groups
+        .iter()
+        .flat_map(|group| &group.items)
+        .flat_map(|item| item.params.iter().map(move |param| (item, param)))
+        .filter(|(_, param)| param.param_type == ListSourceParamType::Enum)
+        .map(|(item, param)| {
+            (
+                item.source_type.as_str(),
+                param.key.as_str(),
+                param.required,
+                param.options.join(","),
+            )
+        })
+        .collect();
+    assert_eq!(
+        enums,
+        vec![
+            (
+                "watchlist",
+                "sort",
+                false,
+                "rank,added,title,released".to_string()
+            ),
+            ("watched", "kind", true, "movies,shows".to_string()),
+            ("collection", "kind", true, "movies,shows".to_string()),
         ]
     );
     assert_eq!(
@@ -696,7 +726,16 @@ fn errors_map_to_host_failure_classes() {
     let lapsed = member(401);
     assert_eq!(lapsed.code, PluginErrorCode::AuthFailed);
     assert!(!lapsed.public_message.contains(TOKEN));
-    for app_rejected in [public(403, &[], ""), member(403)] {
+    // Trakt names a private or deleted list in its 403; a bad client id gets
+    // a bare "Forbidden", and a missing one Cloudflare's HTML page.
+    let gone = public(403, &[], r#""List is private or does not exist""#);
+    assert_eq!(gone.code, PluginErrorCode::Permanent);
+    assert!(gone.public_message.contains("not found"));
+    for app_rejected in [
+        public(403, &[], r#""Forbidden""#),
+        public(403, &[], "<html><title>Attention Required!</title></html>"),
+        member(403),
+    ] {
         assert_eq!(app_rejected.code, PluginErrorCode::InvalidConfig);
     }
     let missing = public(404, &[], "");
@@ -807,4 +846,160 @@ fn a_list_past_the_page_cap_fails_instead_of_being_cut_short() {
     let error = err(fetch(&http, CLIENT, member_request("watchlist", &[], None)));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert_eq!(http.urls(), vec![watchlist]);
+}
+
+#[test]
+fn a_list_id_that_names_no_list_is_not_found() {
+    let http = RecordedHttp::new().with(&api("/lists/7700404"), 204, "");
+    let error = err(fetch(
+        &http,
+        CLIENT,
+        request("list", &[("list_id", "7700404")], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("not found"));
+    assert_eq!(http.urls(), vec![api("/lists/7700404")]);
+}
+
+#[test]
+fn list_names_become_trakt_slugs() {
+    for (typed, slug) in [
+        ("Fixture Picks", "fixture-picks"),
+        ("  Fixture: Top 10 -- 2031! ", "fixture-top-10-2031"),
+        ("fixture_shelf__two", "fixture_shelf__two"),
+        ("_Fixture Shelf_", "_fixture-shelf_"),
+        ("Fixture \u{2605} Picks", "fixture-picks"),
+        ("fixture-picks", "fixture-picks"),
+        ("7700003", "7700003"),
+        (
+            "fixture-picks-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "fixture-picks-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        ),
+    ] {
+        assert_eq!(list_slug(typed).unwrap(), slug, "{typed}");
+    }
+    for typed in ["Caf\u{e9} Fixture", "\u{30d5}\u{30a3}", "!!!"] {
+        assert_eq!(
+            list_slug(typed).unwrap_err().code,
+            PluginErrorCode::InvalidConfig,
+            "{typed}"
+        );
+    }
+
+    let http = RecordedHttp::new()
+        .with(
+            &api("/users/fixture-user/lists/fixture-picks"),
+            200,
+            USER_LIST_SUMMARY,
+        )
+        .with(
+            &items_url("/users/fixture-user/lists/fixture-picks", 1),
+            200,
+            "[]",
+        );
+    ok(fetch(
+        &http,
+        CLIENT,
+        request(
+            "user_list",
+            &[("user", "fixture-user"), ("list", "Fixture Picks")],
+            None,
+        ),
+    ));
+    let mine = RecordedHttp::new()
+        .with(
+            &api("/users/me/lists/fixture-shelf"),
+            200,
+            USER_LIST_SUMMARY,
+        )
+        .with(&items_url("/users/me/lists/fixture-shelf", 1), 200, "[]");
+    ok(fetch(
+        &mine,
+        CLIENT,
+        member_request("my_list", &[("list", "Fixture Shelf")], None),
+    ));
+}
+
+#[test]
+fn watchlist_follows_the_chosen_order() {
+    let added = api("/users/me/watchlist/movie,show/added?page=1&limit=250");
+    let http = RecordedHttp::new().with(&added, 200, "[]");
+    ok(fetch(
+        &http,
+        CLIENT,
+        member_request("watchlist", &[("sort", "added")], None),
+    ));
+    assert_eq!(http.urls(), vec![added]);
+
+    let untouched = RecordedHttp::new();
+    let error = err(fetch(
+        &untouched,
+        CLIENT,
+        member_request("watchlist", &[("sort", "fixture-order")], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(untouched.urls().is_empty());
+}
+
+#[test]
+fn watched_and_collection_read_the_members_titles_by_type() {
+    // Watched entries carry no type field; collection entries do.
+    let watched = r#"[
+      {"plays": 9, "last_watched_at": "2031-04-01T00:00:00.000Z", "last_updated_at": "2031-04-01T00:00:00.000Z",
+       "reset_at": null,
+       "show": {"title": "Fixture Serial Mu", "year": 2028, "aired_episodes": 20,
+                "ids": {"trakt": 900601, "slug": "fixture-serial-mu", "tvdb": 880601, "imdb": "tt0000601", "tmdb": 990601}}}
+    ]"#;
+    let collected = r#"[
+      {"type": "movie", "collected_at": "2031-05-01T00:00:00.000Z", "updated_at": "2031-05-01T00:00:00.000Z",
+       "movie": {"title": "Fixture Feature Nu", "year": 2029,
+                 "ids": {"trakt": 900701, "slug": "fixture-feature-nu-2029", "imdb": "tt0000701", "tmdb": 990701}}}
+    ]"#;
+    let watched_url = api("/users/me/watched/shows?page=1&limit=250");
+    let collected_url = api("/users/me/collection/movies?page=1&limit=250");
+    let http = RecordedHttp::new()
+        .with_headers(
+            &watched_url,
+            200,
+            &[("X-Pagination-Page-Count", "1")],
+            watched,
+        )
+        .with(&collected_url, 200, collected);
+
+    let shows = ok(fetch(
+        &http,
+        CLIENT,
+        member_request("watched", &[("kind", "shows")], None),
+    ));
+    assert_eq!(keys(&shows), vec!["tmdb:series:990601"]);
+    assert_eq!(shows.items[0].kind_hint, Some(ListMediaKind::Series));
+    let movies = ok(fetch(
+        &http,
+        CLIENT,
+        member_request("collection", &[("kind", "movies")], None),
+    ));
+    assert_eq!(keys(&movies), vec!["tmdb:movie:990701"]);
+    for sent in http.requests() {
+        assert_eq!(
+            sent_header(&sent, "Authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+    }
+    assert_eq!(http.urls(), vec![watched_url, collected_url]);
+
+    let untouched = RecordedHttp::new();
+    let code = |request: ListPluginFetchRequest| err(fetch(&untouched, CLIENT, request)).code;
+    assert_eq!(
+        code(member_request("watched", &[], None)),
+        PluginErrorCode::InvalidConfig
+    );
+    assert_eq!(
+        code(member_request("collection", &[("kind", "episodes")], None)),
+        PluginErrorCode::InvalidConfig
+    );
+    assert_eq!(
+        code(request("collection", &[("kind", "movies")], None)),
+        PluginErrorCode::AuthFailed
+    );
+    assert!(untouched.urls().is_empty());
 }
