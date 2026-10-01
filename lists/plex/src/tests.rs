@@ -569,14 +569,46 @@ fn watchlist_paging_without_a_total_and_at_the_cap() {
     assert!(response.next_cursor.is_none());
     assert_eq!(response.total_hint, Some(2));
 
-    // The last allowed request ends the sync however much Plex still holds.
+    // A watchlist past the cap fails rather than being cut short, which
+    // would read as its tail leaving the list. A reported total fails it on
+    // the first page.
+    let cap = u64::from(MAX_PAGES * PAGE_SIZE);
+    let oversized = RecordedHttp::new().with(
+        &watchlist_url(0),
+        200,
+        &container(0, Some(cap + 1), (1..=100).map(movie).collect()),
+    );
+    let error = block_on(fetch_at(
+        &oversized,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+
+    // Without a total, the last allowed request fails when Plex still has
+    // more to give.
     let last = RecordedHttp::new().with(
         &watchlist_url(1900),
         200,
-        &container(1900, Some(9000), (1..=100).map(movie).collect()),
+        &container(1900, None, (1..=100).map(movie).collect()),
+    );
+    let error = block_on(fetch_at(
+        &last,
+        &watchlist_request(Some(TOKEN), Some("19:1900")),
+        NOW_MS,
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+
+    // A watchlist exactly at the cap ends on its last allowed request.
+    let full = RecordedHttp::new().with(
+        &watchlist_url(1900),
+        200,
+        &container(1900, Some(cap), (1..=100).map(movie).collect()),
     );
     let response = block_on(fetch_at(
-        &last,
+        &full,
         &watchlist_request(Some(TOKEN), Some("19:1900")),
         NOW_MS,
     ))

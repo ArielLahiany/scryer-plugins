@@ -11,8 +11,9 @@
 //! `watchlist` is personal. It reads the linked member's own watchlist from
 //! Plex's discover service with the account token the host holds for that
 //! member, sent only in the `X-Plex-Token` header and never on a URL. The
-//! service pages by container offset, so the source caps itself at
-//! [`MAX_PAGES`] and leaves the change fingerprint unset. Each title's first
+//! service pages by container offset, so the source fails past [`MAX_PAGES`]
+//! rather than cutting the list short, and leaves the change fingerprint
+//! unset. Each title's first
 //! release date sets `released`, which the host's released-only filter reads.
 //!
 //! Both sources read `imdb://`, `tmdb://` and `tvdb://` guids and a movie or
@@ -367,8 +368,16 @@ async fn fetch_watchlist<H: ListHttp>(
         Some(total) => u64::from(next_offset) < total,
         None => count >= PAGE_SIZE,
     };
-    let next_cursor =
-        (more && count > 0 && page + 1 < MAX_PAGES).then(|| format!("{}:{next_offset}", page + 1));
+    let more = more && count > 0;
+    // A watchlist past the cap fails rather than being cut short: the host
+    // would read every title after the cap as having left the list.
+    let cap = u64::from(MAX_PAGES * PAGE_SIZE);
+    if total.is_some_and(|total| total > cap) || (more && page + 1 >= MAX_PAGES) {
+        return Err(permanent(format!(
+            "the Plex watchlist has more than {cap} titles, more than Scryer follows"
+        )));
+    }
+    let next_cursor = more.then(|| format!("{}:{next_offset}", page + 1));
 
     let items: Vec<ListPluginItem> = entries
         .iter()
