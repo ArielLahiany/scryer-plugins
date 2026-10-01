@@ -336,7 +336,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
             flow: ListAccountFlow::Pin,
             exchange: ListAccountExchange::Direct,
             byo_app: false,
-            scopes: Vec::new(),
+            scopes: vec!["media:read".to_string()],
         }
     );
     assert!(list.capabilities.account);
@@ -699,6 +699,41 @@ fn the_fingerprint_follows_only_the_libraries_read() {
     );
     assert!(response.unchanged);
 
+    // Another status moving in the same library does not touch it either.
+    let other_status = ACTIVITIES.replace(
+        r#""plantowatch": "2035-02-01T10:00:00Z""#,
+        r#""plantowatch": "2035-02-09T10:00:00Z""#,
+    );
+    let http = library_http(SOURCE_WATCHING, &other_status);
+    let response = fetch_ok(
+        &http,
+        &request(SOURCE_WATCHING, Some("shows"), Some(&shows_only)),
+    );
+    assert!(response.unchanged);
+    assert_eq!(http.urls(), vec![activities_url()]);
+
+    // Its own status moving, or an item leaving the library, rereads it.
+    for moved in [
+        ACTIVITIES.replace(
+            r#""watching": "2035-01-20T10:00:00Z""#,
+            r#""watching": "2035-02-09T10:00:00Z""#,
+        ),
+        ACTIVITIES.replacen(
+            r#""removed_from_list": null"#,
+            r#""removed_from_list": "2035-02-09T10:00:00Z""#,
+            1,
+        ),
+    ] {
+        let http = library_http(SOURCE_WATCHING, &moved);
+        let response = fetch_ok(
+            &http,
+            &request(SOURCE_WATCHING, Some("shows"), Some(&shows_only)),
+        );
+        assert!(!response.unchanged);
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(http.urls().len(), 2);
+    }
+
     // The same timestamps under another status are another fingerprint.
     let completed = fetch_ok(
         &library_http(SOURCE_COMPLETED, ACTIVITIES),
@@ -711,12 +746,25 @@ fn the_fingerprint_follows_only_the_libraries_read() {
 
 #[test]
 fn a_new_member_without_activity_is_still_fingerprinted() {
+    // Simkl's shape for a member who has not touched the library yet.
     let fresh = r#"{
       "all": null,
       "settings": { "all": null },
-      "tv_shows": { "all": null },
-      "anime": { "all": null },
-      "movies": { "all": null }
+      "tv_shows": {
+        "all": null, "rated_at": null, "playback": null, "plantowatch": null,
+        "watching": null, "completed": null, "hold": null, "dropped": null,
+        "removed_from_list": null
+      },
+      "anime": {
+        "all": null, "rated_at": null, "playback": null, "plantowatch": null,
+        "watching": null, "completed": null, "hold": null, "dropped": null,
+        "removed_from_list": null
+      },
+      "movies": {
+        "all": null, "rated_at": null, "playback": null, "plantowatch": null,
+        "completed": null, "dropped": null, "removed_from_list": null
+      },
+      "custom_lists": { "lists": { "all": null } }
     }"#;
     let empty = RecordedHttp::new()
         .with(&activities_url(), 200, fresh)
@@ -738,7 +786,8 @@ fn a_new_member_without_activity_is_still_fingerprinted() {
 fn unusable_activity_falls_back_to_a_content_fingerprint() {
     for activities in [
         r#"{"tv_shows": {"watching": "2035-01-20T10:00:00Z"}}"#,
-        r#"{"tv_shows": {"all": 7}}"#,
+        r#"{"tv_shows": {"all": "2035-01-20T10:00:00Z", "removed_from_list": null}}"#,
+        r#"{"tv_shows": {"watching": 7, "removed_from_list": null}}"#,
         r#"{}"#,
         "",
         "null",
@@ -854,10 +903,6 @@ fn requests_name_the_app_and_carry_the_token_only_in_a_header() {
             Some(format!("Bearer {TOKEN}").as_str())
         );
         assert_eq!(
-            request.headers.get("simkl-api-key").map(String::as_str),
-            Some(CLIENT_ID)
-        );
-        assert_eq!(
             request.headers.get("User-Agent").map(String::as_str),
             Some(concat!("simkl-list-provider/", env!("CARGO_PKG_VERSION")))
         );
@@ -865,10 +910,9 @@ fn requests_name_the_app_and_carry_the_token_only_in_a_header() {
             request.headers.get("Accept").map(String::as_str),
             Some("application/json")
         );
-        assert_eq!(
-            request.headers.get("Content-Type").map(String::as_str),
-            Some("application/json")
-        );
+        // The client id goes once, in the URL; Content-Type is for writes.
+        assert!(!request.headers.contains_key("simkl-api-key"));
+        assert!(!request.headers.contains_key("Content-Type"));
     }
 }
 
@@ -876,8 +920,8 @@ fn requests_name_the_app_and_carry_the_token_only_in_a_header() {
 fn upstream_failures_map_to_host_classes() {
     let cases = [
         (401, PluginErrorCode::AuthFailed, false),
-        // Simkl's 403 is the app's key or its limits, never the member.
-        (403, PluginErrorCode::UpstreamUnavailable, false),
+        // A 403 Simkl gives no reason for is a refusal retrying cannot fix.
+        (403, PluginErrorCode::Permanent, false),
         (404, PluginErrorCode::Permanent, true),
         (412, PluginErrorCode::UpstreamUnavailable, false),
         (429, PluginErrorCode::RateLimited, false),
@@ -943,8 +987,33 @@ fn rejected_tokens_name_simkls_reason_but_never_the_token() {
         r#"{"error":"client_id_failed","code":412}"#,
     );
     let error = fetch_err(&refused, &request(SOURCE_WATCHING, None, None));
+    assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
     assert!(error.public_message.contains("client_id_failed"));
     assert!(!error.public_message.contains(CLIENT_ID));
+}
+
+#[test]
+fn a_403_that_only_a_new_link_fixes_asks_for_one() {
+    for name in ["insufficient_scope", "oauth2_token_required"] {
+        let http = RecordedHttp::new().with(
+            &activities_url(),
+            403,
+            &format!(r#"{{"error":"{name}","code":403,"message":"Fixture refusal"}}"#),
+        );
+        let error = fetch_err(&http, &request(SOURCE_WATCHING, None, None));
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{name}");
+        assert!(error.public_message.contains(name), "{name}");
+    }
+    for name in ["forbidden", "private_list"] {
+        let http = RecordedHttp::new().with(
+            &activities_url(),
+            403,
+            &format!(r#"{{"error":"{name}","code":403}}"#),
+        );
+        let error = fetch_err(&http, &request(SOURCE_WATCHING, None, None));
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{name}");
+        assert!(!error.public_message.contains("not found"), "{name}");
+    }
 }
 
 #[test]

@@ -8,21 +8,21 @@
 //! member's credential is refused before any request.
 //!
 //! Simkl asks every app that syncs on a timer to read `/sync/activities` first
-//! and to skip the library read when nothing moved. The fetch does that: the
-//! fingerprint it returns is made of the activity timestamps of the libraries
-//! it reads, and when they match the fingerprint the host already holds the
-//! library is not read at all. A library always answers in one response, so a
-//! fingerprint taken before the read can only cause an extra read later,
-//! never a missed one.
+//! and to read a list only when its own timestamp moved. The fetch does that:
+//! the fingerprint it returns is made of the timestamps Simkl moves for the
+//! source's status and for removals in each library it reads, and when they
+//! match the fingerprint the host already holds the library is not read at
+//! all. A library always answers in one response, so a fingerprint taken
+//! before the read can only cause an extra read later, never a missed one.
 //!
 //! Anime seasons are separate entries on Simkl. Each stays its own item, keyed
 //! by its Simkl id, and when Simkl maps the entry onto exactly one TVDB season
 //! the item carries that season, so the host can attach it to the parent TVDB
 //! series.
 //!
-//! Every request names Scryer's Simkl app by its client id. The member's
-//! token travels only in the `Authorization` header and never appears in a
-//! URL or an error message.
+//! Every request names Scryer's Simkl app by its client id in the URL, the
+//! form Simkl prefers. The member's token travels only in the `Authorization`
+//! header and never appears in a URL or an error message.
 
 use std::collections::BTreeSet;
 
@@ -58,9 +58,10 @@ list_provider_common::list_component_main!(descriptor = descriptor, handler = ha
 pub const PLUGIN_ID: &str = "simkl-list";
 pub const PROVIDER_TYPE: &str = "simkl";
 
-/// The client id of Scryer's own Simkl app, sent with every request. It stays
-/// empty until that app is registered with Simkl, and every command refuses to
-/// run while it is.
+/// The client id of Scryer's own Simkl app, an AUTH V2 registration, sent with
+/// every request. Simkl documents a V2 client id as public and safe to ship;
+/// that type of app has no secret. It stays empty until that app is
+/// registered with Simkl, and every command refuses to run while it is.
 pub const SIMKL_CLIENT_ID: &str = "";
 
 pub const SOURCE_WATCHING: &str = "watching";
@@ -86,7 +87,12 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const ACCEPT: &str = "application/json";
 /// Adds the TVDB season mapping to anime entries.
 const EXTENDED_ANIME_SEASONS: &str = "full_anime_seasons";
-/// Six hours, the interval the other arrs use for Simkl.
+/// The AUTH V2 scope for reading a member's library. Reads are all this
+/// plugin does, and Simkl asks apps that only read to ask for no more.
+const SCOPE_READ: &str = "media:read";
+/// The activity timestamp Simkl moves when items leave a library entirely.
+const REMOVED_FROM_LIST: &str = "removed_from_list";
+/// Six hours, Sonarr's and Radarr's shortest refresh for a Simkl list.
 const DEFAULT_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
 /// Two seconds between fetches, the spacing Sonarr and Radarr give every
 /// list they read, Simkl included.
@@ -306,11 +312,15 @@ pub fn descriptor() -> PluginDescriptor {
                 ListMediaKind::Series,
                 ListMediaKind::Anime,
             ],
+            // Simkl's AUTH V2 device flow: the member types a short code at
+            // simkl.com/pin. It takes only the public client id, so no secret
+            // and no relay are involved. Access tokens last seven days and
+            // refresh tokens 180 days, renewed on each use.
             auth: ListProviderAuth::MemberAccount {
                 flow: ListAccountFlow::Pin,
                 exchange: ListAccountExchange::Direct,
                 byo_app: false,
-                scopes: Vec::new(),
+                scopes: vec![SCOPE_READ.to_string()],
             },
             groups: vec![ListProviderGroup {
                 label: "Your Simkl library".to_string(),
@@ -439,13 +449,6 @@ impl<'a, H: ListHttp> Client<'a, H> {
 
     fn request(&self, path: &str, extended: Option<&str>) -> PluginHttpRequest {
         let mut request = get(self.url(path, extended), USER_AGENT, ACCEPT);
-        // Simkl lists both as required headers on every call.
-        request
-            .headers
-            .insert("Content-Type".to_string(), ACCEPT.to_string());
-        request
-            .headers
-            .insert("simkl-api-key".to_string(), self.client_id.to_string());
         request.headers.insert(
             "Authorization".to_string(),
             format!("Bearer {}", self.token),
@@ -544,15 +547,17 @@ impl<'a, H: ListHttp> Client<'a, H> {
 }
 
 /// Simkl's error name from an error body's `error` field, kept only when it
-/// is a plain lowercase identifier so nothing else from the body reaches a
-/// message.
+/// is a plain lowercase identifier (such as `oauth2_token_required`) so
+/// nothing else from the body reaches a message. Simkl's tokens all start
+/// with `simkl_`, so nothing shaped like one is kept.
 fn error_name(body: &Value) -> Option<&str> {
     let name = body.get("error")?.as_str()?.trim();
     let plain = !name.is_empty()
+        && !name.starts_with("simkl_")
         && name.len() <= MAX_ERROR_NAME_LEN
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
     plain.then_some(name)
 }
 
@@ -561,46 +566,74 @@ fn response_error_name(response: &PluginHttpResponse) -> Option<String> {
     error_name(&body).map(str::to_string)
 }
 
-/// Map a Simkl failure onto the host's classes. Every Simkl call here carries
-/// the member's token, so a 401 means the linked account no longer works.
-/// Simkl documents a 403 as a bad or unapproved app key or a request over its
-/// limits, and a 412 as a bad client id or the app's total request limit, so
-/// both are Simkl refusing Scryer's app, not the member.
+/// Map a Simkl failure onto the host's classes.
+///
+/// Every Simkl call here carries the member's token, so a 401 means the token
+/// is expired, revoked or unknown; a V2 access token lasts seven days, and
+/// renewing it with the refresh token is the host's part.
+///
+/// Simkl documents a 403 as a refusal that retrying cannot fix. Two of its
+/// reasons, `insufficient_scope` and `oauth2_token_required`, are fixed only
+/// by the member authorizing Scryer's app again; the rest are not the
+/// member's to fix.
+///
+/// A 412 is Simkl refusing Scryer's app itself: a wrong or suspended client
+/// id, or a throttling block that lifts with time.
+///
+/// Anything else, 429 included, follows the shared mapping. A 429 carries
+/// `Retry-After` when it is a member's daily allowance.
 fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
     let status = response.status;
-    let detail = || match response_error_name(response) {
+    let name = response_error_name(response);
+    let detail = match &name {
         Some(name) => format!("HTTP {status}, {name}"),
         None => format!("HTTP {status}"),
     };
     match status {
         401 => Err(auth_failed(format!(
-            "Simkl rejected the linked account ({})",
-            detail()
+            "Simkl rejected the linked account ({detail})"
         ))),
-        403 | 412 => Err(unavailable(format!(
-            "Simkl refused Scryer's Simkl app ({}); it may be throttling the app",
-            detail()
+        403 if matches!(
+            name.as_deref(),
+            Some("insufficient_scope" | "oauth2_token_required")
+        ) =>
+        {
+            Err(auth_failed(format!(
+                "Simkl needs the account linked to Scryer's Simkl app again ({detail})"
+            )))
+        }
+        403 => Err(permanent(format!("Simkl refused the request ({detail})"))),
+        412 => Err(unavailable(format!(
+            "Simkl refused Scryer's Simkl app ({detail}); Simkl answers this for a wrong or \
+             suspended app id or while it throttles the app"
         ))),
         _ => check_status(response, Access::ServerKey, what),
     }
 }
 
-/// The activity timestamps of every library a source reads, or `None` when
-/// any of them is missing or malformed. A timestamp Simkl reports as null
-/// (no activity yet) is a real value: the first activity changes it.
+/// The activity timestamps a source depends on in every library it reads, or
+/// `None` when any of them is missing or malformed. Simkl moves a status's
+/// timestamp when items move into or out of that status, and
+/// `removed_from_list` when items leave the library entirely, and its sync
+/// loop rereads a list only when one of those moved. A timestamp Simkl
+/// reports as null (no activity yet) is a real value: the first activity
+/// changes it.
 fn activity_fingerprint(
     activities: &Value,
     status: Status,
     libraries: &[Library],
 ) -> Option<String> {
-    let mut parts = Vec::with_capacity(libraries.len());
+    let mut parts = Vec::with_capacity(libraries.len() * 2);
     for library in libraries {
-        let stamp = match activities.get(library.activity_key())?.get("all")? {
-            Value::String(stamp) if !stamp.trim().is_empty() => stamp.trim().to_string(),
-            Value::Null => "-".to_string(),
-            _ => return None,
-        };
-        parts.push(format!("{}={stamp}", library.path()));
+        let block = activities.get(library.activity_key())?;
+        for field in [status.key(), REMOVED_FROM_LIST] {
+            let stamp = match block.get(field)? {
+                Value::String(stamp) if !stamp.trim().is_empty() => stamp.trim().to_string(),
+                Value::Null => "-".to_string(),
+                _ => return None,
+            };
+            parts.push(format!("{}.{field}={stamp}", library.path()));
+        }
     }
     Some(format!(
         "simkl:v1:{APP_VERSION}:{}:{}",
