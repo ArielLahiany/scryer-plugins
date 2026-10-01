@@ -788,3 +788,23 @@ fn a_missing_client_id_fails_cleanly_without_calling_trakt() {
     }
     assert!(http.urls().is_empty());
 }
+
+#[test]
+fn a_list_past_the_page_cap_fails_instead_of_being_cut_short() {
+    let watchlist = api("/users/me/watchlist/movie,show/rank?page=1&limit=250");
+    let page_count = (MAX_PAGES + 1).to_string();
+    let http = RecordedHttp::new().with_headers(
+        &watchlist,
+        200,
+        &[
+            ("X-Pagination-Page", "1"),
+            ("X-Pagination-Limit", "250"),
+            ("X-Pagination-Page-Count", page_count.as_str()),
+            ("X-Pagination-Item-Count", "10001"),
+        ],
+        "[]",
+    );
+    let error = err(fetch(&http, CLIENT, member_request("watchlist", &[], None)));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert_eq!(http.urls(), vec![watchlist]);
+}

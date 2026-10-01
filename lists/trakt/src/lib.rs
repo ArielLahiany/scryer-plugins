@@ -79,7 +79,7 @@ const JSON: &str = "application/json";
 /// maximum, so ranks follow the limit it reports back.
 pub const PAGE_LIMIT: u32 = 250;
 /// Deepest page followed: 10,000 entries, well inside the host's
-/// hundred-page ceiling per sync.
+/// hundred-page ceiling per sync. A longer list fails instead.
 pub const MAX_PAGES: u32 = 40;
 /// Lists asked for per page when listing the member's own lists.
 const ACCOUNT_LIST_LIMIT: u32 = 100;
@@ -462,10 +462,18 @@ impl<H: ListHttp> Client<'_, H> {
         let limit = header_number(&response, "x-pagination-limit")
             .filter(|limit| *limit > 0)
             .unwrap_or(PAGE_LIMIT);
-        let last = page_count.clamp(1, MAX_PAGES);
+        // A list past the cap fails rather than being cut short: the host
+        // would read every title after the cap as having left the list.
+        if page_count > MAX_PAGES {
+            return Err(permanent(format!(
+                "{} has more than {} entries, more than Scryer follows",
+                target.what,
+                MAX_PAGES.saturating_mul(limit)
+            )));
+        }
         Ok(ListPluginFetchResponse {
             items: dedupe_and_rank(items, (page - 1).saturating_mul(limit) + 1),
-            next_cursor: (page < last).then(|| (page + 1).to_string()),
+            next_cursor: (page < page_count).then(|| (page + 1).to_string()),
             list_name,
             list_url,
             total_hint: header_number(&response, "x-pagination-item-count")
