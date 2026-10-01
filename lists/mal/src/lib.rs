@@ -19,8 +19,7 @@
 //! client id header.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, permanent, plugin_error, rate_limited, retry_after_seconds,
-    unsupported_source,
+    Access, auth_failed, check_status, permanent, plugin_error, unavailable, unsupported_source,
 };
 use list_provider_common::http::{HostHttp, ListHttp, get, json_body};
 use list_provider_common::ids::{dedupe_and_rank, json_id, json_text, json_year};
@@ -78,8 +77,11 @@ pub const PAGE_LIMIT: u32 = 1000;
 /// Deepest page followed: 20,000 entries, well inside the host's
 /// hundred-page ceiling per sync.
 pub const MAX_PAGES: u32 = 20;
-/// Six hours, the interval the other arrs use for MyAnimeList.
+/// Six hours, Sonarr's shortest refresh for a MyAnimeList list.
 const DEFAULT_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+/// MyAnimeList documents no rate limit, so requests keep the arrs' default
+/// two-second spacing for list requests.
+const RATE_LIMIT_SECONDS: i64 = 2;
 
 fn kinds() -> Vec<ListMediaKind> {
     vec![ListMediaKind::Anime, ListMediaKind::Movie]
@@ -153,9 +155,7 @@ pub fn descriptor() -> PluginDescriptor {
             config_fields: Vec::new(),
             default_base_url: None,
             allowed_hosts: vec![API_HOST.to_string()],
-            // MyAnimeList publishes no rate limit but answers request floods
-            // with 403, so calls stay a second apart.
-            rate_limit_seconds: Some(1),
+            rate_limit_seconds: Some(RATE_LIMIT_SECONDS),
         }),
     }
 }
@@ -214,15 +214,16 @@ fn authorized_get(url: String, token: &str) -> PluginHttpRequest {
     request
 }
 
-/// MyAnimeList answers an expired or revoked token with 401, and documents
-/// 403 as its request-flood guard rather than a permission answer, so 403
-/// backs the provider off instead of marking the list gone.
+/// MyAnimeList answers an expired or invalid token with 401. It documents 403
+/// as "DoS detected etc." and also answers 403 to a request that carries no
+/// client credentials, so 403 is MyAnimeList refusing the request for now,
+/// never a sign that the list is gone.
 fn check_mal_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
     match response.status {
         401 => Err(auth_failed(
             "MyAnimeList no longer accepts the linked account (HTTP 401)",
         )),
-        403 => Err(rate_limited(retry_after_seconds(response))),
+        403 => Err(unavailable("MyAnimeList refused the request (HTTP 403)")),
         _ => check_status(response, Access::ServerKey, what),
     }
 }
@@ -325,8 +326,10 @@ fn query_offset(url: &str) -> Option<u32> {
 
 /// How a MyAnimeList media type routes, and the format it is filed under.
 /// Films are movies; every other screen format is an anime series, keeping
-/// MyAnimeList's own name for the format. Music videos, commercials and
-/// promotional videos are not titles Scryer manages and are skipped.
+/// MyAnimeList's own name for the format. Music videos are not titles Scryer
+/// manages and are skipped. MyAnimeList's site also files commercials (CM)
+/// and promotional videos (PV) as anime; its API documents no value for
+/// them, so `cm` and `pv` are skipped too and any other value routes as anime.
 pub fn media_kind(media_type: &str) -> Option<(ListMediaKind, Option<String>)> {
     match media_type {
         "movie" => Some((ListMediaKind::Movie, Some("movie".to_string()))),

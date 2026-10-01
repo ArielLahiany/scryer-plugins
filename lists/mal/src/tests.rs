@@ -163,7 +163,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
     assert!(list.config_fields.is_empty(), "no server key or client id");
     assert!(list.url_patterns.is_empty(), "nothing public to recognise");
     assert_eq!(list.allowed_hosts, vec!["api.myanimelist.net".to_string()]);
-    assert_eq!(list.rate_limit_seconds, Some(1));
+    assert_eq!(list.rate_limit_seconds, Some(2));
     assert_eq!(
         list.coverage,
         vec![ListMediaKind::Anime, ListMediaKind::Movie]
@@ -505,20 +505,16 @@ fn errors_map_to_host_failure_classes() {
     assert_eq!(expired.code, PluginErrorCode::AuthFailed);
     assert!(!expired.public_message.contains(TOKEN));
 
-    let flood = list(403, &[("Retry-After", "120")], r#"{"error": "forbidden"}"#);
+    // MyAnimeList's 403 is "DoS detected etc." and also its answer to a
+    // request without client credentials: a refusal for now, not a 429.
+    let refused = list(403, &[], r#"{"message":"","error":"forbidden"}"#);
+    assert_eq!(refused.code, PluginErrorCode::UpstreamUnavailable);
+    assert!(!refused.public_message.contains("not found"));
+    let refused_without_body = list(403, &[], "");
     assert_eq!(
-        (flood.code, flood.retry_after_seconds),
-        (PluginErrorCode::RateLimited, Some(120))
+        refused_without_body.code,
+        PluginErrorCode::UpstreamUnavailable
     );
-    let flood_without_hint = list(403, &[], "");
-    assert_eq!(
-        (
-            flood_without_hint.code,
-            flood_without_hint.retry_after_seconds
-        ),
-        (PluginErrorCode::RateLimited, Some(300))
-    );
-    assert!(!flood_without_hint.public_message.contains("not found"));
 
     let missing = list(404, &[], r#"{"error": "not_found", "message": ""}"#);
     assert_eq!(missing.code, PluginErrorCode::Permanent);
@@ -643,10 +639,10 @@ fn account_errors_and_partial_identities() {
         PluginErrorCode::AuthFailed
     );
 
-    let flood = RecordedHttp::new().with(ACCOUNT_URL, 403, "");
+    let refused = RecordedHttp::new().with(ACCOUNT_URL, 403, "");
     assert_eq!(
-        err(account_of(&flood, TOKEN)).code,
-        PluginErrorCode::RateLimited
+        err(account_of(&refused, TOKEN)).code,
+        PluginErrorCode::UpstreamUnavailable
     );
 
     let nothing = RecordedHttp::new();
