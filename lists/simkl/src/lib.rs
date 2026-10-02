@@ -58,10 +58,11 @@ list_provider_common::list_component_main!(descriptor = descriptor, handler = ha
 pub const PLUGIN_ID: &str = "simkl-list";
 pub const PROVIDER_TYPE: &str = "simkl";
 
-/// The client id of Scryer's own Simkl app, an AUTH V2 registration, sent with
-/// every request. Simkl documents a V2 client id as public and safe to ship;
-/// that type of app has no secret. It stays empty until that app is
-/// registered with Simkl, and every command refuses to run while it is.
+/// The client id of Scryer's own Simkl app, an AUTH V2 server registration
+/// whose secret only the relay holds. Simkl requires a client id on every
+/// request, accepts a member's token only with the client id that issued it,
+/// and documents the id as public and safe to ship. It stays empty until that
+/// app is registered with Simkl, and every command refuses to run while it is.
 pub const SIMKL_CLIENT_ID: &str = "";
 
 pub const SOURCE_WATCHING: &str = "watching";
@@ -312,13 +313,16 @@ pub fn descriptor() -> PluginDescriptor {
                 ListMediaKind::Series,
                 ListMediaKind::Anime,
             ],
-            // Simkl's AUTH V2 device flow: the member types a short code at
-            // simkl.com/pin. It takes only the public client id, so no secret
-            // and no relay are involved. Access tokens last seven days and
-            // refresh tokens 180 days, renewed on each use.
+            // Simkl's AUTH V2 authorization code flow, which requires PKCE
+            // from every app. Scryer's Simkl app is a server registration, and
+            // Simkl wants its secret on every token exchange and refresh, so
+            // the relay holds it and renews the seven-day access tokens. An
+            // operator's own app is not offered: Simkl accepts a token only
+            // with the client id that issued it, and every request here sends
+            // Scryer's.
             auth: ListProviderAuth::MemberAccount {
-                flow: ListAccountFlow::Pin,
-                exchange: ListAccountExchange::Direct,
+                flow: ListAccountFlow::AuthorizationCode { pkce: true },
+                exchange: ListAccountExchange::SmgRelay,
                 byo_app: false,
                 scopes: vec![SCOPE_READ.to_string()],
             },
@@ -327,16 +331,10 @@ pub fn descriptor() -> PluginDescriptor {
                 auth_badge: ListAuthBadge::MemberAccount,
                 items: Status::ALL.into_iter().map(status_item).collect(),
             }],
-            notes: vec![
-                ListProviderNote {
-                    tone: ListNoteTone::Info,
-                    text_key: "lists.note.simkl_anime_seasons".to_string(),
-                },
-                ListProviderNote {
-                    tone: ListNoteTone::Info,
-                    text_key: "lists.note.simkl_pin".to_string(),
-                },
-            ],
+            notes: vec![ListProviderNote {
+                tone: ListNoteTone::Info,
+                text_key: "lists.note.simkl_anime_seasons".to_string(),
+            }],
             url_patterns: Vec::new(),
             capabilities: ListProviderCapabilities {
                 account: true,
@@ -570,7 +568,7 @@ fn response_error_name(response: &PluginHttpResponse) -> Option<String> {
 ///
 /// Every Simkl call here carries the member's token, so a 401 means the token
 /// is expired, revoked or unknown; a V2 access token lasts seven days, and
-/// renewing it with the refresh token is the host's part.
+/// renewing it needs Scryer's app secret, so it is the relay's part.
 ///
 /// Simkl documents a 403 as a refusal that retrying cannot fix. Two of its
 /// reasons, `insufficient_scope` and `oauth2_token_required`, are fixed only

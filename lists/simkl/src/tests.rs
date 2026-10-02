@@ -333,8 +333,8 @@ fn descriptor_round_trips_and_passes_host_checks() {
     assert_eq!(
         list.auth,
         ListProviderAuth::MemberAccount {
-            flow: ListAccountFlow::Pin,
-            exchange: ListAccountExchange::Direct,
+            flow: ListAccountFlow::AuthorizationCode { pkce: true },
+            exchange: ListAccountExchange::SmgRelay,
             byo_app: false,
             scopes: vec!["media:read".to_string()],
         }
@@ -362,10 +362,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
         .iter()
         .map(|note| note.text_key.as_str())
         .collect();
-    assert_eq!(
-        notes,
-        vec!["lists.note.simkl_anime_seasons", "lists.note.simkl_pin"]
-    );
+    assert_eq!(notes, vec!["lists.note.simkl_anime_seasons"]);
 }
 
 #[test]
