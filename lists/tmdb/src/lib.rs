@@ -2,7 +2,9 @@
 //!
 //! Follows four kinds of public TMDb sources with the server's TMDb API key:
 //!
-//! - `list`: a public list by id, paged through `/3/list/{id}`.
+//! - `list`: a public list by id, paged through `/4/list/{id}` when the
+//!   server key is a v4 read access token, and through `/3/list/{id}` with a
+//!   v3 API key.
 //! - `person`: everything a person is credited on, from one
 //!   `/3/person/{id}?append_to_response=combined_credits` read: their cast
 //!   credits, their crew credits, or the crew credits of one department.
@@ -98,10 +100,10 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const ACCEPT: &str = "application/json";
 /// TMDb's fixed page size for lists and discover.
 const PAGE_SIZE: u32 = 20;
-/// Deepest page followed: 1,000 titles, the most the other arrs read from one
-/// list, well inside the host's hundred-page ceiling per sync and TMDb's own
-/// 500-page limit.
-pub const MAX_PAGES: u32 = 50;
+/// Deepest page followed: 1,980 titles, just inside the host's hundred-page
+/// ceiling per sync and well inside TMDb's own 500-page limit. Following
+/// movies and shows together gives each kind half of it.
+pub const MAX_PAGES: u32 = 99;
 /// Twelve hours, the interval the other arrs use for TMDb lists.
 const DEFAULT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// TMDb status codes that mean the key itself is bad, as opposed to a
@@ -421,12 +423,12 @@ impl<'a> Member<'a> {
         let token = credential
             .map(|credential| credential.access_token.trim())
             .filter(|token| !token.is_empty())
-            .ok_or_else(|| invalid_config("this list needs a linked TMDb account"))?;
+            .ok_or_else(|| auth_failed("this list needs a linked TMDb account"))?;
         let account_id = credential
             .and_then(|credential| credential.external_user_id.as_deref())
             .map(str::trim)
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| invalid_config("the linked TMDb account carries no account id"))?;
+            .ok_or_else(|| auth_failed("the linked TMDb account carries no account id"))?;
         Ok(Self { token, account_id })
     }
 
@@ -445,11 +447,13 @@ impl<'a> Member<'a> {
     }
 }
 
-/// What a member call reads, which decides what a TMDb 401 means.
+/// What a member call reads, which decides what a TMDb 401, 403 or 404
+/// means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemberRead {
-    /// The member's own watchlist, favorites or list index: any 401 means
-    /// TMDb no longer accepts the linked account.
+    /// The member's own watchlist, favorites, ratings, recommendations or
+    /// list index: any 401 or 403 means TMDb no longer accepts the linked
+    /// account, and a 404 is never the collection being gone.
     Account,
     /// A list named by id, which may be someone else's private list.
     ListById,
@@ -472,7 +476,7 @@ impl AccountPage {
         let single = |kind| {
             Ok(Self {
                 kind,
-                page: numeric_cursor(cursor, 1)?.max(1),
+                page: page_cursor(cursor, MAX_PAGES)?,
                 rank_base: 0,
             })
         };
@@ -498,7 +502,7 @@ impl AccountPage {
                     _ => return Err(invalid()),
                 };
                 match (page.parse::<u32>(), rank_base.parse::<u32>()) {
-                    (Ok(page @ 1..), Ok(rank_base)) => Ok(Self {
+                    (Ok(page), Ok(rank_base)) if (1..=MAX_PAGES / 2).contains(&page) => Ok(Self {
                         kind,
                         page,
                         rank_base,
@@ -508,6 +512,16 @@ impl AccountPage {
             }
         }
     }
+}
+
+/// A numbered page cursor, from 1 to `max_pages`. A cursor past the cap is
+/// never sent: the host only hands back cursors this plugin issued.
+fn page_cursor(cursor: Option<&str>, max_pages: u32) -> Result<u32, PluginError> {
+    let page = numeric_cursor(cursor, 1)?.max(1);
+    if page > max_pages {
+        return Err(permanent(format!("invalid page cursor {page}")));
+    }
+    Ok(page)
 }
 
 fn chained_cursor(kind: ListMediaKind, page: u32, rank_base: u32) -> String {
@@ -574,7 +588,17 @@ impl<H: ListHttp> Client<'_, H> {
             .ok_or_else(|| invalid_config("the TMDb API key is not configured"))
     }
 
-    fn request(&self, path_and_query: &str) -> Result<PluginHttpRequest, PluginError> {
+    /// Whether the server key is a v4 read access token, which can read the
+    /// v4 API.
+    fn has_bearer_key(&self) -> bool {
+        self.api_key.is_some_and(is_bearer_token)
+    }
+
+    fn request_at(
+        &self,
+        base: &str,
+        path_and_query: &str,
+    ) -> Result<PluginHttpRequest, PluginError> {
         let key = self.key()?;
         let separator = if path_and_query.contains('?') {
             '&'
@@ -582,7 +606,7 @@ impl<H: ListHttp> Client<'_, H> {
             '?'
         };
         if is_bearer_token(key) {
-            let mut request = get(format!("{API_BASE}{path_and_query}"), USER_AGENT, ACCEPT);
+            let mut request = get(format!("{base}{path_and_query}"), USER_AGENT, ACCEPT);
             request
                 .headers
                 .insert("Authorization".to_string(), format!("Bearer {key}"));
@@ -590,7 +614,7 @@ impl<H: ListHttp> Client<'_, H> {
         } else {
             Ok(get(
                 format!(
-                    "{API_BASE}{path_and_query}{separator}api_key={}",
+                    "{base}{path_and_query}{separator}api_key={}",
                     encode_component(key)
                 ),
                 USER_AGENT,
@@ -600,7 +624,19 @@ impl<H: ListHttp> Client<'_, H> {
     }
 
     async fn get_json(&self, path_and_query: &str, what: &str) -> Result<Value, PluginError> {
-        let response = self.http.send(self.request(path_and_query)?).await?;
+        self.get_json_at(API_BASE, path_and_query, what).await
+    }
+
+    async fn get_json_at(
+        &self,
+        base: &str,
+        path_and_query: &str,
+        what: &str,
+    ) -> Result<Value, PluginError> {
+        let response = self
+            .http
+            .send(self.request_at(base, path_and_query)?)
+            .await?;
         check_tmdb_status(&response, what)?;
         json_body(&response)
     }
@@ -699,12 +735,16 @@ impl<H: ListHttp> Client<'_, H> {
                 MemberRead::Account,
             )
             .await?;
-        let max_pages = if kinds == KindFilter::All {
-            MAX_PAGES / 2
+        let what = format!("TMDb {collection}");
+        if kinds == KindFilter::All {
+            let unit = match position.kind {
+                ListMediaKind::Series => "shows",
+                _ => "movies",
+            };
+            within_cap(total_pages(&body), MAX_PAGES / 2, &what, unit)?;
         } else {
-            MAX_PAGES
-        };
-        within_cap(&body, max_pages, &format!("TMDb {collection}"))?;
+            within_cap(total_pages(&body), MAX_PAGES, &what, "titles")?;
+        }
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -735,12 +775,14 @@ impl<H: ListHttp> Client<'_, H> {
             None,
         );
         for item in &mut response.items {
-            item.rank = item.rank.map(|rank| rank + position.rank_base);
+            item.rank = item
+                .rank
+                .map(|rank| rank.saturating_add(position.rank_base));
         }
         response.next_cursor = match response.next_cursor.take() {
             Some(_) => Some(chained_cursor(
                 position.kind,
-                position.page + 1,
+                position.page.saturating_add(1),
                 position.rank_base,
             )),
             None if position.kind == ListMediaKind::Movie => {
@@ -748,7 +790,11 @@ impl<H: ListHttp> Client<'_, H> {
                     .items
                     .last()
                     .and_then(|item| item.rank)
-                    .unwrap_or(position.rank_base + (position.page - 1) * PAGE_SIZE);
+                    .unwrap_or_else(|| {
+                        position
+                            .rank_base
+                            .saturating_add(page_offset(position.page))
+                    });
                 Some(chained_cursor(ListMediaKind::Series, 1, movies))
             }
             None => None,
@@ -764,7 +810,7 @@ impl<H: ListHttp> Client<'_, H> {
     ) -> Result<ListPluginFetchResponse, PluginError> {
         let member = Member::from_credential(request.credential.as_ref())?;
         let list_id = required_id(request, PARAM_LIST_ID)?;
-        let page = numeric_cursor(request.page_cursor.as_deref(), 1)?.max(1);
+        let page = page_cursor(request.page_cursor.as_deref(), MAX_PAGES)?;
         let body = self
             .get_member_json(
                 member,
@@ -773,21 +819,21 @@ impl<H: ListHttp> Client<'_, H> {
                 MemberRead::ListById,
             )
             .await?;
-        within_cap(&body, MAX_PAGES, "TMDb list")?;
-        let items = body
+        let entries = body
             .get("results")
             .and_then(Value::as_array)
-            .map(|results| {
-                results
-                    .iter()
-                    .filter_map(|entry| to_item(entry, None))
-                    .collect()
-            })
+            .map(Vec::as_slice)
             .unwrap_or_default();
+        let pages = list_total_pages(&body, page, entries.len(), &list_id)?;
+        within_cap(pages, MAX_PAGES, "TMDb list", "titles")?;
+        let items = entries
+            .iter()
+            .filter_map(|entry| to_item(entry, None))
+            .collect();
         Ok(paged(
             items,
             page,
-            total_pages(&body),
+            pages,
             body.get("total_results").or_else(|| body.get("item_count")),
             json_text(body.get("name")),
             Some(format!("{SITE_BASE}/list/{list_id}")),
@@ -824,6 +870,9 @@ impl<H: ListHttp> Client<'_, H> {
             page += 1;
         }
 
+        // The owner is only a name and an avatar: a first list that cannot
+        // be read leaves the member unnamed by it rather than failing the
+        // link.
         let owner = match owned_lists.first() {
             Some(list) => self
                 .get_member_json(
@@ -832,10 +881,10 @@ impl<H: ListHttp> Client<'_, H> {
                     &format!("TMDb list {}", list.id),
                     MemberRead::ListById,
                 )
-                .await?
-                .get("created_by")
-                .filter(|owner| json_text(owner.get("id")).as_deref() == Some(member.account_id))
-                .cloned(),
+                .await
+                .ok()
+                .and_then(|body| body.get("created_by").cloned())
+                .filter(|owner| json_text(owner.get("id")).as_deref() == Some(member.account_id)),
             None => None,
         };
         let field = |key: &str| owner.as_ref().and_then(|owner| json_text(owner.get(key)));
@@ -866,20 +915,31 @@ impl<H: ListHttp> Client<'_, H> {
         request: &ListPluginFetchRequest,
     ) -> Result<ListPluginFetchResponse, PluginError> {
         let list_id = required_id(request, PARAM_LIST_ID)?;
-        let page = numeric_cursor(request.page_cursor.as_deref(), 1)?.max(1);
+        let page = page_cursor(request.page_cursor.as_deref(), MAX_PAGES)?;
+        // TMDb documents `total_pages` for a v4 list read but not for v3, so
+        // a v4 read access token reads the list through v4, as Radarr does.
+        // A v3 API key cannot read v4 and falls back to v3, where the list's
+        // item count bounds the pages instead.
+        let base = if self.has_bearer_key() {
+            API_V4_BASE
+        } else {
+            API_BASE
+        };
         let body = self
-            .get_json(
+            .get_json_at(
+                base,
                 &format!("/list/{list_id}?page={page}"),
                 &format!("TMDb list {list_id}"),
             )
             .await?;
-        within_cap(&body, MAX_PAGES, "TMDb list")?;
         let entries = body
-            .get("items")
-            .or_else(|| body.get("results"))
+            .get("results")
+            .or_else(|| body.get("items"))
             .and_then(Value::as_array)
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
+        let pages = list_total_pages(&body, page, entries.len(), &list_id)?;
+        within_cap(pages, MAX_PAGES, "TMDb list", "titles")?;
         let items = entries
             .iter()
             .filter_map(|entry| to_item(entry, None))
@@ -887,7 +947,7 @@ impl<H: ListHttp> Client<'_, H> {
         Ok(paged(
             items,
             page,
-            total_pages(&body),
+            pages,
             body.get("total_results").or_else(|| body.get("item_count")),
             json_text(body.get("name")),
             Some(format!("{SITE_BASE}/list/{list_id}")),
@@ -974,14 +1034,19 @@ impl<H: ListHttp> Client<'_, H> {
             ListMediaKind::Series => ("tv", "first_air_date.desc"),
             _ => ("movie", "primary_release_date.desc"),
         };
-        let page = numeric_cursor(request.page_cursor.as_deref(), 1)?.max(1);
+        let page = page_cursor(request.page_cursor.as_deref(), MAX_PAGES)?;
         let body = self
             .get_json(
                 &format!("/discover/{endpoint}?{filter}={id}&sort_by={sort}&include_adult=false&page={page}"),
                 &format!("TMDb {site_path} {id}"),
             )
             .await?;
-        within_cap(&body, MAX_PAGES, &format!("TMDb {site_path}"))?;
+        within_cap(
+            total_pages(&body),
+            MAX_PAGES,
+            &format!("TMDb {site_path}"),
+            "titles",
+        )?;
         let items = body
             .get("results")
             .and_then(Value::as_array)
@@ -1029,11 +1094,32 @@ fn check_tmdb_status(response: &PluginHttpResponse, what: &str) -> Result<(), Pl
 /// which the host shows as an expired account to reconnect. The one exception
 /// is a list read by id that TMDb calls private: that list is not this
 /// member's to read, and the account is fine.
+///
+/// The member's own collections are addressed by their account, so they can
+/// never be gone on their own: a 403 there is TMDb refusing the linked
+/// account, and a 404 a failure that must not read as the collection having
+/// been deleted.
 fn check_member_status(
     response: &PluginHttpResponse,
     what: &str,
     read: MemberRead,
 ) -> Result<(), PluginError> {
+    if read == MemberRead::Account {
+        match response.status {
+            403 => {
+                return Err(auth_failed(
+                    "TMDb refused the linked account access to its own titles (HTTP 403)",
+                ));
+            }
+            404 | 410 => {
+                return Err(permanent(format!(
+                    "TMDb did not serve the {what} for the linked account (HTTP {})",
+                    response.status
+                )));
+            }
+            _ => {}
+        }
+    }
     if response.status == 401 {
         return Err(
             if read == MemberRead::ListById
@@ -1067,16 +1153,66 @@ fn total_pages(body: &Value) -> u32 {
         .unwrap_or(1)
 }
 
+/// The pages a list read has, from its `total_pages`. TMDb does not document
+/// `total_pages` for a v3 list, so without it the list's item count decides:
+/// the list ends once every item has been read, a page that comes back empty
+/// before then fails, and a full page with no count at all fails too, since
+/// its end cannot be told. None of these guesses a shorter list.
+fn list_total_pages(
+    body: &Value,
+    page: u32,
+    read_on_page: usize,
+    list_id: &str,
+) -> Result<u32, PluginError> {
+    if body.get("total_pages").and_then(Value::as_u64).is_some() {
+        return Ok(total_pages(body));
+    }
+    let read_on_page = u64::try_from(read_on_page).unwrap_or(u64::MAX);
+    let read = u64::from(page_offset(page)).saturating_add(read_on_page);
+    let count = body
+        .get("item_count")
+        .or_else(|| body.get("total_results"))
+        .and_then(Value::as_u64);
+    match count {
+        Some(count) if read >= count => Ok(page),
+        Some(count) if read_on_page == 0 => Err(permanent(format!(
+            "TMDb list {list_id} stopped after {read} of its {count} titles"
+        ))),
+        Some(count) => {
+            let pages = count.div_ceil(u64::from(PAGE_SIZE));
+            Ok(u32::try_from(pages)
+                .unwrap_or(u32::MAX)
+                .max(page.saturating_add(1)))
+        }
+        None if read_on_page >= u64::from(PAGE_SIZE) => Err(permanent(format!(
+            "TMDb list {list_id} does not say how many titles it holds"
+        ))),
+        None => Ok(page),
+    }
+}
+
 /// A source past `max_pages` fails rather than being cut short: the host
-/// would read every title after the cap as having left the list.
-fn within_cap(body: &Value, max_pages: u32, what: &str) -> Result<(), PluginError> {
-    if total_pages(body) > max_pages {
+/// would read every title after the cap as having left the list. `unit`
+/// names what the cap counts: titles, or one kind's movies or shows when
+/// both kinds share the pages.
+fn within_cap(total_pages: u32, max_pages: u32, what: &str, unit: &str) -> Result<(), PluginError> {
+    if total_pages > max_pages {
+        let per_kind = if unit == "titles" {
+            ""
+        } else {
+            " when following movies and shows together"
+        };
         return Err(permanent(format!(
-            "the {what} has more than {} titles, more than Scryer follows",
+            "the {what} has more than {} {unit}, more than Scryer follows{per_kind}",
             max_pages * PAGE_SIZE
         )));
     }
     Ok(())
+}
+
+/// The titles on the pages before `page`.
+fn page_offset(page: u32) -> u32 {
+    page.saturating_sub(1).saturating_mul(PAGE_SIZE)
 }
 
 fn paged(
@@ -1088,12 +1224,12 @@ fn paged(
     list_url: Option<String>,
 ) -> ListPluginFetchResponse {
     let last = total_pages.clamp(1, MAX_PAGES);
-    let next_cursor = (page < last).then(|| (page + 1).to_string());
+    let next_cursor = (page < last).then(|| page.saturating_add(1).to_string());
     let total_hint = total
         .and_then(Value::as_u64)
         .map(|total| total.min(u64::from(MAX_PAGES * PAGE_SIZE)) as u32);
     ListPluginFetchResponse {
-        items: dedupe_and_rank(items, (page - 1) * PAGE_SIZE + 1),
+        items: dedupe_and_rank(items, page_offset(page).saturating_add(1)),
         next_cursor,
         list_name,
         list_url,

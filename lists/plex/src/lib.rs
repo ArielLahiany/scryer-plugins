@@ -24,7 +24,8 @@
 //! undocumented GraphQL service that returns titles without ids.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, missing_param, permanent, plugin_error, unsupported_source,
+    Access, auth_failed, check_status, missing_param, permanent, plugin_error, unavailable,
+    unsupported_source,
 };
 use list_provider_common::feed::parse_feed;
 use list_provider_common::http::{
@@ -68,6 +69,13 @@ const ACCOUNT_HOST: &str = "plex.tv";
 pub const WATCHLIST_URL: &str = "https://discover.provider.plex.tv/library/sections/watchlist/all";
 pub const ACCOUNT_URL: &str = "https://plex.tv/users/account.json";
 const TOKEN_HEADER: &str = "X-Plex-Token";
+/// The client identity Plex asks every client to send, the same one Scryer's
+/// Plex notification plugin uses. Plex documents the client identifier as
+/// typically required; the rest describe the client.
+const PLEX_CLIENT_IDENTIFIER: &str = "scryer";
+const PLEX_PRODUCT: &str = "Scryer";
+const PLEX_PLATFORM: &str = "Scryer";
+const PLEX_DEVICE_NAME: &str = "Scryer";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const ACCEPT: &str = "application/rss+xml, application/xml;q=0.9, */*;q=0.1";
 const ACCEPT_JSON: &str = "application/json";
@@ -282,20 +290,37 @@ async fn fetch_feed<H: ListHttp>(
     ))
 }
 
-/// The linked member's token. A personal source without one cannot be read.
+/// The linked member's token. A personal source without one cannot be read,
+/// and a malformed one asks for the account to be linked again; the token
+/// itself never appears in a message.
 fn member_token(credential: Option<&ListCredential>) -> Result<&str, PluginError> {
-    credential
+    let token = credential
         .map(|credential| credential.access_token.trim())
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| auth_failed("this watchlist needs a linked Plex account"))
+        .ok_or_else(|| auth_failed("this watchlist needs a linked Plex account"))?;
+    if token
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err(auth_failed("the linked Plex account has an unusable token"));
+    }
+    Ok(token)
 }
 
-/// A GET that carries the member's token in its header, never in the URL.
+/// A GET that carries the member's token in its header, never in the URL,
+/// along with the client identity Plex expects.
 fn member_get(url: String, token: &str) -> PluginHttpRequest {
     let mut request = get(url, USER_AGENT, ACCEPT_JSON);
-    request
-        .headers
-        .insert(TOKEN_HEADER.to_string(), token.to_string());
+    for (name, value) in [
+        ("X-Plex-Client-Identifier", PLEX_CLIENT_IDENTIFIER),
+        ("X-Plex-Product", PLEX_PRODUCT),
+        ("X-Plex-Version", env!("CARGO_PKG_VERSION")),
+        ("X-Plex-Platform", PLEX_PLATFORM),
+        ("X-Plex-Device-Name", PLEX_DEVICE_NAME),
+        (TOKEN_HEADER, token),
+    ] {
+        request.headers.insert(name.to_string(), value.to_string());
+    }
     request
 }
 
@@ -358,23 +383,31 @@ async fn fetch_watchlist<H: ListHttp>(
         .unwrap_or_default();
 
     let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    // Plex may answer with fewer titles than asked, so only the total it
+    // reports can say where the watchlist ends. Without one the end cannot be
+    // told from a short page, and guessing would hand the host a shortened
+    // list whose tail reads as having left it.
     let total = container
         .get("totalSize")
         .and_then(Value::as_u64)
         .or_else(|| {
             header(&response, "X-Plex-Container-Total-Size")
                 .and_then(|total| total.trim().parse::<u64>().ok())
-        });
+        })
+        .ok_or_else(|| {
+            permanent("the Plex watchlist response does not say how many titles it holds")
+        })?;
     let next_offset = offset.saturating_add(count);
-    let more = match total {
-        Some(total) => u64::from(next_offset) < total,
-        None => count >= PAGE_SIZE,
-    };
-    let more = more && count > 0;
+    let more = u64::from(next_offset) < total;
+    if more && count == 0 {
+        return Err(unavailable(format!(
+            "Plex returned an empty watchlist page at {offset} of {total} titles"
+        )));
+    }
     // A watchlist past the cap fails rather than being cut short: the host
     // would read every title after the cap as having left the list.
     let cap = u64::from(MAX_PAGES * PAGE_SIZE);
-    if total.is_some_and(|total| total > cap) || (more && page + 1 >= MAX_PAGES) {
+    if total > cap || (more && page + 1 >= MAX_PAGES) {
         return Err(permanent(format!(
             "the Plex watchlist has more than {cap} titles, more than Scryer follows"
         )));
@@ -390,7 +423,7 @@ async fn fetch_watchlist<H: ListHttp>(
         next_cursor,
         list_name: Some("Plex watchlist".to_string()),
         list_url: None,
-        total_hint: total.map(|total| total.min(u64::from(MAX_PAGES * PAGE_SIZE)) as u32),
+        total_hint: Some(total.min(cap) as u32),
         // A paged source carries no fingerprint: the host compares only the
         // first page. `released` also changes with the date alone.
         fingerprint: None,
@@ -447,7 +480,7 @@ fn guid_ids(entry: &Value) -> Ids {
 
 /// Days since the Unix epoch, or `None` when the clock is unknown.
 fn today(now_ms: u64) -> Option<i64> {
-    (now_ms > 0).then(|| (now_ms / MILLIS_PER_DAY) as i64)
+    (now_ms > 0).then_some((now_ms / MILLIS_PER_DAY) as i64)
 }
 
 /// Whether a title has come out by `today`, from its first release date or,
@@ -519,7 +552,7 @@ pub async fn account<H: ListHttp>(
         external_user_id,
         username,
         display_name,
-        avatar_url: json_text(user.get("thumb")),
+        avatar_url: json_text(user.get("thumb")).filter(|url| url.starts_with("https://")),
         owned_lists: Vec::new(),
         statuses: Vec::new(),
     })
