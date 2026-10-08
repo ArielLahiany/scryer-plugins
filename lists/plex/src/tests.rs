@@ -389,6 +389,20 @@ fn own_watchlist() -> String {
     )
 }
 
+/// The client identity every member request carries.
+fn assert_plex_identity(request: &PluginHttpRequest) {
+    let header = |name: &str| request.headers.get(name).map(String::as_str);
+    assert_eq!(header("X-Plex-Client-Identifier"), Some("scryer"));
+    assert_eq!(header("X-Plex-Product"), Some("Scryer"));
+    assert_eq!(header("X-Plex-Version"), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(header("X-Plex-Platform"), Some("Scryer"));
+    assert_eq!(header("X-Plex-Device-Name"), Some("Scryer"));
+    assert!(
+        !request.url.contains("X-Plex-Client-Identifier"),
+        "identity goes in headers"
+    );
+}
+
 fn token_header(request: &PluginHttpRequest) -> Option<&str> {
     request
         .headers
@@ -418,6 +432,7 @@ fn own_watchlist_reads_with_the_token_header_and_matches_rss_keys() {
     );
     assert!(!requests[0].url.contains(TOKEN));
     assert!(!requests[0].url.contains("X-Plex-Token"));
+    assert_plex_identity(&requests[0]);
 
     assert!(response.next_cursor.is_none());
     assert!(response.fingerprint.is_none());
@@ -474,6 +489,10 @@ fn the_public_feed_never_receives_the_member_token() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url, FEED_URL);
     assert_eq!(token_header(&requests[0]), None);
+    assert!(
+        !requests[0].headers.contains_key("X-Plex-Client-Identifier"),
+        "the public feed is read anonymously"
+    );
     assert!(
         requests[0]
             .headers
@@ -538,21 +557,6 @@ fn watchlist_pages_by_container_offset() {
 
 #[test]
 fn watchlist_paging_without_a_total_and_at_the_cap() {
-    // No total anywhere: a full page means there may be more.
-    let full = RecordedHttp::new().with(
-        &watchlist_url(0),
-        200,
-        &container(0, None, (1..=100).map(movie).collect()),
-    );
-    let response = block_on(fetch_at(
-        &full,
-        &watchlist_request(Some(TOKEN), None),
-        NOW_MS,
-    ))
-    .unwrap();
-    assert_eq!(response.next_cursor.as_deref(), Some("1:100"));
-    assert_eq!(response.total_hint, None);
-
     // The total can come from the container header instead.
     let header_total = RecordedHttp::new().with_headers(
         &watchlist_url(0),
@@ -586,12 +590,12 @@ fn watchlist_paging_without_a_total_and_at_the_cap() {
     .unwrap_err();
     assert_eq!(error.code, PluginErrorCode::Permanent);
 
-    // Without a total, the last allowed request fails when Plex still has
-    // more to give.
+    // Short pages can use up the requests before the total is reached: the
+    // last allowed request fails when Plex still has more to give.
     let last = RecordedHttp::new().with(
         &watchlist_url(1900),
         200,
-        &container(1900, None, (1..=100).map(movie).collect()),
+        &container(1900, Some(cap), (1..=50).map(movie).collect()),
     );
     let error = block_on(fetch_at(
         &last,
@@ -628,6 +632,77 @@ fn watchlist_paging_without_a_total_and_at_the_cap() {
         assert_eq!(error.code, PluginErrorCode::Permanent, "{cursor}");
         assert!(http.urls().is_empty(), "{cursor}");
     }
+}
+
+#[test]
+fn a_short_page_with_a_total_continues_where_it_ended() {
+    let http = RecordedHttp::new().with(
+        &watchlist_url(100),
+        200,
+        &container(100, Some(250), (1..=40).map(movie).collect()),
+    );
+    let response = block_on(fetch_at(
+        &http,
+        &watchlist_request(Some(TOKEN), Some("1:100")),
+        NOW_MS,
+    ))
+    .unwrap();
+    assert_eq!(response.next_cursor.as_deref(), Some("2:140"));
+    assert_eq!(response.total_hint, Some(250));
+    assert_eq!(response.items[0].rank, Some(101));
+}
+
+#[test]
+fn an_empty_page_before_the_total_fails_instead_of_ending_the_list() {
+    for body in [
+        container(200, Some(250), Vec::new()),
+        r#"{"MediaContainer": {"offset": 200, "size": 0, "totalSize": 250}}"#.to_string(),
+    ] {
+        let http = RecordedHttp::new().with(&watchlist_url(200), 200, &body);
+        let error = block_on(fetch_at(
+            &http,
+            &watchlist_request(Some(TOKEN), Some("2:200")),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable, "{body}");
+        assert!(!error.public_message.contains("not found"));
+    }
+}
+
+#[test]
+fn a_page_without_a_total_fails_instead_of_guessing_the_end() {
+    // Plex may send short pages, so neither a short, a full nor an empty page
+    // says where the watchlist ends when no total comes with it.
+    for count in [0, 3, 100] {
+        let http = RecordedHttp::new().with(
+            &watchlist_url(0),
+            200,
+            &container(0, None, (1..=count).map(movie).collect()),
+        );
+        let error = block_on(fetch_at(
+            &http,
+            &watchlist_request(Some(TOKEN), None),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{count}");
+        assert!(!error.public_message.contains("not found"), "{count}");
+    }
+    // An unreadable header total is no total either.
+    let http = RecordedHttp::new().with_headers(
+        &watchlist_url(0),
+        200,
+        &[("X-Plex-Container-Total-Size", "fixture")],
+        &container(0, None, (1..=3).map(movie).collect()),
+    );
+    let error = block_on(fetch_at(
+        &http,
+        &watchlist_request(Some(TOKEN), None),
+        NOW_MS,
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::Permanent);
 }
 
 #[test]
@@ -752,6 +827,7 @@ fn account_reads_the_plex_identity_through_the_header() {
     assert_eq!(requests[0].url, "https://plex.tv/users/account.json");
     assert_eq!(token_header(&requests[0]), Some(TOKEN));
     assert!(!requests[0].url.contains(TOKEN));
+    assert_plex_identity(&requests[0]);
 }
 
 #[test]
@@ -762,6 +838,12 @@ fn account_falls_back_to_the_uuid_and_title() {
     assert_eq!(identity.external_user_id, "fixture-uuid-0002");
     assert_eq!(identity.username, "Fixture Home User");
     assert_eq!(identity.display_name.as_deref(), Some("Fixture Home User"));
+    assert_eq!(identity.avatar_url, None);
+
+    // Only an https avatar is passed on.
+    let body = r#"{"user": {"id": 990003, "thumb": "http://images.example.test/plain.png"}}"#;
+    let http = RecordedHttp::new().with(ACCOUNT_URL, 200, body);
+    let identity = block_on(account(&http, &account_request(TOKEN))).unwrap();
     assert_eq!(identity.avatar_url, None);
 
     for body in [
@@ -860,5 +942,24 @@ fn a_personal_source_without_a_credential_fails_before_any_request() {
     }
     let error = block_on(account(&http, &account_request(" "))).unwrap_err();
     assert_eq!(error.code, PluginErrorCode::AuthFailed);
+
+    // A token that could break the request header is refused unsent, and
+    // never echoed.
+    for broken in [
+        "fixture\r\nX-Injected: 1",
+        "fixture token",
+        "fixture\ttoken",
+    ] {
+        let error = block_on(fetch_at(
+            &http,
+            &watchlist_request(Some(broken), None),
+            NOW_MS,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{broken:?}");
+        assert!(!error.public_message.contains("fixture"));
+        let error = block_on(account(&http, &account_request(broken))).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{broken:?}");
+    }
     assert!(http.urls().is_empty());
 }
