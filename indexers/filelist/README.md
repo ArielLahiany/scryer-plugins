@@ -61,6 +61,11 @@ next one runs only if the tier before it returned nothing.
 Movie searches append the release year to a name query when the host supplies
 one and the query does not already contain it (Radarr's behaviour).
 
+Name queries replace colons with spaces and collapse whitespace before URL
+encoding: FileList returns no matches for `Fall 2: Deadpoint 2026`, but returns
+the releases for `Fall 2 Deadpoint 2026`. This does not change the catalog title
+or IMDb queries.
+
 Requests are additionally paced at one start every 2 seconds, matching Sonarr's
 per-indexer `RateLimit`. A single automatic search therefore costs 1–2 calls,
 and an anime episode search at most 4.

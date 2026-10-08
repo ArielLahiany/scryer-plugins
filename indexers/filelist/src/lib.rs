@@ -531,17 +531,22 @@ fn imdb_query(request: &SearchRequest) -> Option<String> {
 /// host own the alias fan-out. Radarr's movie generator appends the release
 /// year when it has no IMDb id, which is reproduced here.
 fn name_query(request: &SearchRequest) -> Option<String> {
-    let query = request.query.trim();
+    let query = request
+        .query
+        .replace(':', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if query.is_empty() {
         return None;
     }
     if facet_kind(request) != FacetKind::Movie {
-        return Some(query.to_string());
+        return Some(query);
     }
     let year = request.context.as_ref().and_then(|context| context.year);
     match year {
         Some(year) if !query.contains(&year.to_string()) => Some(format!("{query} {year}")),
-        _ => Some(query.to_string()),
+        _ => Some(query),
     }
 }
 
@@ -1929,6 +1934,51 @@ mod tests {
 
         let tiers = build_request_tiers(&test_config(), &req);
         assert!(tiers[0].contains("&type=name&query=Arrival%202016&"));
+    }
+
+    #[test]
+    fn movie_name_queries_normalize_colons_without_changing_the_imdb_tier() {
+        for query in [
+            "Fall 2: Deadpoint",
+            "Fall 2:Deadpoint",
+            "  Fall 2 :  Deadpoint 2026  ",
+        ] {
+            let mut req = request();
+            req.facet = Some("movie".to_string());
+            req.query = query.to_string();
+            req.ids
+                .insert("imdb_id".to_string(), "tt27166072".to_string());
+            req.context = Some(PluginSearchContext {
+                year: Some(2026),
+                ..PluginSearchContext::default()
+            });
+
+            let tiers = build_request_tiers(&test_config(), &req);
+            assert_eq!(tiers.len(), 2);
+            assert!(tiers[0].contains("&type=imdb&query=tt27166072&"));
+            assert!(tiers[1].contains("&type=name&query=Fall%202%20Deadpoint%202026&"));
+            assert_eq!(req.query, query);
+        }
+    }
+
+    #[test]
+    fn series_name_queries_normalize_colons_and_preserve_other_punctuation() {
+        let mut req = request();
+        req.facet = Some("series".to_string());
+        req.query = "Marvel's Agents: S.H.I.E.L.D.".to_string();
+
+        assert_eq!(
+            name_query(&req).as_deref(),
+            Some("Marvel's Agents S.H.I.E.L.D.")
+        );
+    }
+
+    #[test]
+    fn a_colon_only_name_query_issues_no_requests() {
+        let mut req = request();
+        req.query = " : ".to_string();
+
+        assert!(build_request_tiers(&test_config(), &req).is_empty());
     }
 
     #[test]
