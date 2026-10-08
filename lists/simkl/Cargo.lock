@@ -456,6 +456,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "simkl-list-provider"
+version = "1.0.0"
+dependencies = [
+ "list-provider-common",
+ "regex",
+ "scryer-plugin-pdk",
+ "scryer-plugin-sdk",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,18 +528,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
-]
-
-[[package]]
-name = "tmdb-list-provider"
-version = "1.1.0"
-dependencies = [
- "list-provider-common",
- "regex",
- "scryer-plugin-pdk",
- "scryer-plugin-sdk",
- "serde_json",
- "wit-bindgen",
 ]
 
 [[package]]

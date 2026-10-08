@@ -1,20 +1,20 @@
 [package]
-name = "plex-list-provider"
-version = "1.1.0"
+name = "simkl-list-provider"
+version = "1.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Plex watchlist list provider over the public watchlist RSS feed or a linked Plex account"
+description = "Simkl list provider for a member's watching, plan to watch, on hold, completed and dropped lists"
 
 [package.metadata.scryer]
 official = true
-plugin_id = "plex-list"
+plugin_id = "simkl-list"
 catalog_versions = ["v3"]
 # The first Scryer release whose host serves
 # `scryer:lists/list-provider@1.0.0`. An older host has no list family and
 # cannot bind this artifact at all.
 min_scryer_version = "0.21.11"
-docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/plex"
-source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/plex"
+docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/simkl"
+source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/simkl"
 
 [lib]
 crate-type = ["cdylib"]

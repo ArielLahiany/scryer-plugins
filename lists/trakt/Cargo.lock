@@ -519,8 +519,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "tmdb-list-provider"
-version = "1.1.0"
+name = "trakt-list-provider"
+version = "1.0.0"
 dependencies = [
  "list-provider-common",
  "regex",
