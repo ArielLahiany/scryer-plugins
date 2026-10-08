@@ -16,7 +16,10 @@
 //! member's account link lapses. Personal sources send the member's bearer
 //! token, which the host renews; the plugin never refreshes it.
 //!
-//! Every request carries the Scryer Trakt app's client id. Parameterless
+//! Every request carries a Trakt app client id: the one the host places in
+//! the plugin config under `client_id` (Scryer's own app, or the operator's
+//! when they linked with their own), else the id compiled into this build.
+//! Parameterless
 //! charts (trending, popular, anticipated, box office and the rest) are served
 //! by the metadata gateway and are deliberately absent here.
 
@@ -56,11 +59,14 @@ list_provider_common::list_component_main!(descriptor = descriptor, handler = ha
 pub const PLUGIN_ID: &str = "trakt-list";
 pub const PROVIDER_TYPE: &str = "trakt";
 
-/// The Scryer Trakt app's client id, sent as `trakt-api-key` on every
-/// request. It stays empty until the scryer-media app is registered with
-/// Trakt; until then every fetch and account call fails with a plain
-/// configuration error instead of reaching Trakt.
+/// The client id compiled into this build, used only when the host's config
+/// carries none. It stays empty: the host supplies Scryer's own app id, or
+/// an operator's own, under [`CONFIG_CLIENT_ID`]. With neither, every fetch
+/// and account call fails with a plain configuration error instead of
+/// reaching Trakt.
 pub const TRAKT_CLIENT_ID: &str = "";
+/// The config key the host places the Trakt app client id under.
+pub const CONFIG_CLIENT_ID: &str = "client_id";
 
 pub const SOURCE_USER_LIST: &str = "user_list";
 pub const SOURCE_LIST: &str = "list";
@@ -102,8 +108,8 @@ const MAX_ACCOUNT_LIST_PAGES: u32 = 10;
 /// Twelve hours, the interval the other arrs use for Trakt lists.
 const DEFAULT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// Five seconds between fetches, the spacing Sonarr gives Trakt lists. Trakt
-/// allows 500 reads per five minutes, counted per app for anonymous reads
-/// and per member for signed-in ones.
+/// allows 500 GET calls per five minutes in each bucket: one per member for
+/// signed-in reads and one per client id and public IP for anonymous ones.
 const RATE_LIMIT_SECONDS: i64 = 5;
 
 const NO_CLIENT_ID: &str = "this build of the Trakt plugin has no Trakt app client id, so it \
@@ -184,11 +190,12 @@ pub fn descriptor() -> PluginDescriptor {
             }),
             brand_url_template: None,
             coverage: vec![ListMediaKind::Movie, ListMediaKind::Series],
-            // Trakt's authorize step takes no PKCE challenge and no scopes,
-            // and its token exchange needs the app secret, which only the
-            // relay or an operator's own app holds.
+            // Trakt signs members in on auth.trakt.tv with a PKCE S256
+            // challenge and no scopes; the code exchange sends the verifier,
+            // and the app secret is optional. An operator may link with their
+            // own app, whose client id the host passes in the config.
             auth: ListProviderAuth::MemberAccount {
-                flow: ListAccountFlow::AuthorizationCode { pkce: false },
+                flow: ListAccountFlow::AuthorizationCode { pkce: true },
                 exchange: ListAccountExchange::SmgRelay,
                 byo_app: true,
                 scopes: Vec::new(),
@@ -287,7 +294,25 @@ pub fn descriptor() -> PluginDescriptor {
 }
 
 async fn handle_command(command: PluginListCommand) -> PluginListCommandResult {
-    run(&HostHttp, TRAKT_CLIENT_ID, command).await
+    let configured = scryer_plugin_pdk::config::get(CONFIG_CLIENT_ID)
+        .ok()
+        .flatten();
+    run(
+        &HostHttp,
+        client_id(configured.as_deref(), TRAKT_CLIENT_ID),
+        command,
+    )
+    .await
+}
+
+/// The client id to send: the host's configured one when it is set, else
+/// the one built in. An empty result makes every call fail as a
+/// configuration error.
+pub fn client_id<'a>(configured: Option<&'a str>, built_in: &'a str) -> &'a str {
+    configured
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| built_in.trim())
 }
 
 fn into_result<T>(result: Result<T, PluginError>) -> PluginResult<T> {
@@ -329,8 +354,14 @@ struct Client<'a, H> {
 
 /// Where one source's entries live and how to describe it.
 struct Target {
-    /// The paged items endpoint, without its query.
+    /// The items endpoint, without its paging query.
     items_path: String,
+    /// Query parameters sent ahead of `page` and `limit`.
+    query: &'static str,
+    /// Whether Trakt documents the endpoint as paginated. A paged endpoint
+    /// that answers a full page without paging headers cannot vouch for the
+    /// rest of the list, so that page fails instead of ending it.
+    paged: bool,
     /// The list summary, read on the first page for the name and address.
     summary_path: Option<String>,
     /// The address to show when the summary gives none.
@@ -428,9 +459,12 @@ fn member_token(credential: Option<&ListCredential>) -> Result<String, PluginErr
 }
 
 /// Lists carry seasons and episodes as well as movies and shows; each maps to
-/// its show. The watchlist endpoint for every type at once takes movies and
-/// shows only, in the order the member picks. Watched and collection read
-/// one type at a time.
+/// its show. The watchlist reads Trakt's documented movies-and-shows
+/// endpoint, `/users/{id}/watchlist/movie,show/{sort}`, in the order the
+/// member picks, so watchlisted seasons and episodes stay out. Watched and
+/// collection read one type at a time and are not documented as paginated;
+/// watched shows ask for `extended=noseasons`, which leaves out every
+/// season and episode Trakt would otherwise send for each show.
 fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
     const LIST_ITEMS: &str = "items/movie,show,season,episode";
     match request.source_type.as_str() {
@@ -444,6 +478,8 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
             );
             Ok(Target {
                 items_path: format!("{path}/{LIST_ITEMS}"),
+                query: "",
+                paged: true,
                 summary_path: Some(path.clone()),
                 site_url: Some(format!("{SITE_BASE}{path}")),
                 token: None,
@@ -454,6 +490,8 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
             let id = numeric_list_id(request)?;
             Ok(Target {
                 items_path: format!("/lists/{id}/{LIST_ITEMS}"),
+                query: "",
+                paged: true,
                 summary_path: Some(format!("/lists/{id}")),
                 site_url: Some(format!("{SITE_BASE}/lists/{id}")),
                 token: None,
@@ -464,6 +502,8 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
             let sort = choice(request, PARAM_SORT, &WATCHLIST_SORTS, Some("rank"))?;
             Ok(Target {
                 items_path: format!("/users/me/watchlist/movie,show/{sort}"),
+                query: "",
+                paged: true,
                 summary_path: None,
                 site_url: None,
                 token: Some(member_token(request.credential.as_ref())?),
@@ -475,6 +515,12 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
             let source = request.source_type.as_str();
             Ok(Target {
                 items_path: format!("/users/me/{source}/{kind}"),
+                query: if source == SOURCE_WATCHED && kind == "shows" {
+                    "extended=noseasons"
+                } else {
+                    ""
+                },
+                paged: false,
                 summary_path: None,
                 site_url: None,
                 token: Some(member_token(request.credential.as_ref())?),
@@ -487,6 +533,8 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
             let path = format!("/users/me/lists/{}", encode_component(&list));
             Ok(Target {
                 items_path: format!("{path}/{LIST_ITEMS}"),
+                query: "",
+                paged: true,
                 summary_path: Some(path),
                 site_url: None,
                 token: Some(token),
@@ -556,9 +604,16 @@ impl<H: ListHttp> Client<'_, H> {
             list_url = summary_url(&summary).or(list_url);
         }
 
+        let query = match target.query {
+            "" => String::new(),
+            query => format!("{query}&"),
+        };
         let response = self
             .send(
-                &format!("{}?page={page}&limit={PAGE_LIMIT}", target.items_path),
+                &format!(
+                    "{}?{query}page={page}&limit={PAGE_LIMIT}",
+                    target.items_path
+                ),
                 token,
                 &target.what,
             )
@@ -571,9 +626,25 @@ impl<H: ListHttp> Client<'_, H> {
             ))
         })?;
         let items = merge_entries(entries.iter().filter_map(to_item).collect());
+        let limit = header_number(&response, "x-pagination-limit")
+            .filter(|limit| *limit > 0)
+            .unwrap_or(PAGE_LIMIT);
 
-        // A missing page count means Trakt sent everything at once.
-        let page_count = header_number(&response, "x-pagination-page-count").unwrap_or(page);
+        let page_count = match header_number(&response, "x-pagination-page-count") {
+            Some(page_count) => page_count,
+            // A paged endpoint that fills a page without saying how many
+            // follow may have more: ending here would read every later title
+            // as having left the list.
+            None if target.paged && entries.len() >= limit as usize => {
+                return Err(permanent(format!(
+                    "Trakt answered page {page} of {} without paging headers, so Scryer cannot \
+                     tell whether the list is complete",
+                    target.what
+                )));
+            }
+            // A short page, or an endpoint Trakt does not page, is the last.
+            None => page,
+        };
         if page == 1 && page_count <= 1 {
             return Ok(single_page(
                 dedupe_and_rank(items, 1),
@@ -582,9 +653,6 @@ impl<H: ListHttp> Client<'_, H> {
                 request.since_fingerprint.as_deref(),
             ));
         }
-        let limit = header_number(&response, "x-pagination-limit")
-            .filter(|limit| *limit > 0)
-            .unwrap_or(PAGE_LIMIT);
         // A list past the cap fails rather than being cut short: the host
         // would read every title after the cap as having left the list.
         if page_count > MAX_PAGES {
@@ -595,7 +663,7 @@ impl<H: ListHttp> Client<'_, H> {
             )));
         }
         Ok(ListPluginFetchResponse {
-            items: dedupe_and_rank(items, (page - 1).saturating_mul(limit) + 1),
+            items: dedupe_and_rank(items, (page - 1).saturating_mul(limit).saturating_add(1)),
             next_cursor: (page < page_count).then(|| (page + 1).to_string()),
             list_name,
             list_url,
@@ -682,8 +750,10 @@ impl<H: ListHttp> Client<'_, H> {
 
 /// Trakt's documented status codes onto the host's failure classes. A 401
 /// is a lapsed member token when one was sent, and a private list when the
-/// request was anonymous. Trakt answers a list that is private or gone with
-/// a 403 that says so; any other 403 rejects the app's client id.
+/// request was anonymous. Trakt documents a 403 as an invalid API key or an
+/// unapproved app; a private or deleted list has been seen to answer a 403
+/// that says so, which is read as not found, and any other 403 names both
+/// causes. A 410 is a deactivated member account, never a missing list.
 fn check_trakt_status(
     response: &PluginHttpResponse,
     authorized: bool,
@@ -700,9 +770,17 @@ fn check_trakt_status(
         {
             Err(not_found(format!("{what} (private or deleted, HTTP 403)")))
         }
-        403 => Err(invalid_config(
-            "Trakt rejected the plugin's app client id (HTTP 403)",
+        403 => Err(invalid_config(format!(
+            "Trakt refused {what} (HTTP 403): the Trakt app client id was rejected, or the \
+             list is private"
+        ))),
+        410 if authorized => Err(auth_failed(
+            "the Trakt account is deactivated; its owner must sign in on trakt.tv to reactivate \
+             it, then reconnect it (HTTP 410)",
         )),
+        410 => Err(permanent(format!(
+            "Trakt answered {what} with HTTP 410; the owner's account may be deactivated"
+        ))),
         420 => Err(permanent(format!(
             "{what} is over a Trakt account limit (HTTP 420)"
         ))),

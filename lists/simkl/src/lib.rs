@@ -15,20 +15,33 @@
 //! all. A library always answers in one response, so a fingerprint taken
 //! before the read can only cause an extra read later, never a missed one.
 //!
-//! Anime seasons are separate entries on Simkl. Each stays its own item, keyed
-//! by its Simkl id, and when Simkl maps the entry onto exactly one TVDB season
-//! the item carries that season, so the host can attach it to the parent TVDB
-//! series.
+//! When a timestamp moved, the status is read whole but in Simkl's ID-only
+//! form, `extended=ids_only`: the payload Simkl documents as cheap to pull in
+//! full for finding what left a list. Simkl's richer forms, and above all
+//! `full_anime_seasons`, must be paired with `date_from` on every sync after
+//! the first, and a `date_from` delta names only what changed, never what
+//! left, so this plugin reads neither. Without a cache of earlier syncs it
+//! could not rebuild a whole status from a delta, and the host keeps no item
+//! details between syncs.
 //!
-//! Every request names Scryer's Simkl app by its client id in the URL, the
-//! form Simkl prefers. The member's token travels only in the `Authorization`
-//! header and never appears in a URL or an error message.
+//! Anime seasons are separate entries on Simkl. Each stays its own item, keyed
+//! by its Simkl id. The ID-only form carries no anime subtype, so the anime
+//! movies of a status come from a second ID-only read narrowed with
+//! `anime_type=movies`; every other anime entry is anime whose ids name a
+//! series. Neither form carries Simkl's TVDB season mapping, so an anime
+//! entry follows the series its ids name.
+//!
+//! Every request names a Simkl app by its client id in the URL, the form
+//! Simkl prefers: the one the host places in the plugin config under
+//! `client_id`, else the id compiled into this build. The member's token
+//! travels only in the `Authorization` header and never appears in a URL or
+//! an error message.
 
 use std::collections::BTreeSet;
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, permanent, plugin_error, unavailable,
-    unsupported_source,
+    Access, auth_failed, check_status, invalid_config, permanent, plugin_error, rate_limited,
+    retry_after_seconds, unavailable, unsupported_source,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, json_body};
 use list_provider_common::ids::{
@@ -58,12 +71,15 @@ list_provider_common::list_component_main!(descriptor = descriptor, handler = ha
 pub const PLUGIN_ID: &str = "simkl-list";
 pub const PROVIDER_TYPE: &str = "simkl";
 
-/// The client id of Scryer's own Simkl app, an AUTH V2 server registration
-/// whose secret only the relay holds. Simkl requires a client id on every
-/// request, accepts a member's token only with the client id that issued it,
-/// and documents the id as public and safe to ship. It stays empty until that
-/// app is registered with Simkl, and every command refuses to run while it is.
+/// The client id compiled into this build, used only when the host's config
+/// carries none. Simkl requires a client id on every request, accepts a
+/// member's token only with the client id that issued it, and documents the
+/// id as public and safe to ship. It stays empty: the host supplies the id of
+/// the app that linked the member under [`CONFIG_CLIENT_ID`], and with
+/// neither every command refuses to run.
 pub const SIMKL_CLIENT_ID: &str = "";
+/// The config key the host places the Simkl app client id under.
+pub const CONFIG_CLIENT_ID: &str = "client_id";
 
 pub const SOURCE_WATCHING: &str = "watching";
 pub const SOURCE_PLAN_TO_WATCH: &str = "plantowatch";
@@ -86,8 +102,14 @@ const APP_NAME: &str = "scryer";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const ACCEPT: &str = "application/json";
-/// Adds the TVDB season mapping to anime entries.
-const EXTENDED_ANIME_SEASONS: &str = "full_anime_seasons";
+/// Simkl's ID-only form of a library read: every id it holds for each entry
+/// and nothing else.
+const EXTENDED_IDS_ONLY: &str = "ids_only";
+/// Narrows an anime read to anime movies, the only value Simkl accepts.
+const ANIME_TYPE_MOVIES: &str = "movies";
+/// The retry hint for Simkl's per-second burst limit, which Simkl says clears
+/// in about a second. Its `Retry-After` is not used.
+const BURST_RETRY_SECONDS: i64 = 2;
 /// The AUTH V2 scope for reading a member's library. Reads are all this
 /// plugin does, and Simkl asks apps that only read to ask for no more.
 const SCOPE_READ: &str = "media:read";
@@ -228,10 +250,6 @@ impl Library {
             Self::Movies => "movie",
         }
     }
-
-    fn extended(self) -> Option<&'static str> {
-        (self == Self::Anime).then_some(EXTENDED_ANIME_SEASONS)
-    }
 }
 
 /// The libraries a status source reads, in output order.
@@ -316,10 +334,10 @@ pub fn descriptor() -> PluginDescriptor {
             // Simkl's AUTH V2 authorization code flow, which requires PKCE
             // from every app. Scryer's Simkl app is a server registration, and
             // Simkl wants its secret on every token exchange and refresh, so
-            // the relay holds it and renews the seven-day access tokens. An
-            // operator's own app is not offered: Simkl accepts a token only
-            // with the client id that issued it, and every request here sends
-            // Scryer's.
+            // the relay holds it and renews the seven-day access tokens. Simkl
+            // accepts a token only with the client id that issued it, which
+            // the host passes in the config with the member's link. An
+            // operator's own app is not offered.
             auth: ListProviderAuth::MemberAccount {
                 flow: ListAccountFlow::AuthorizationCode { pkce: true },
                 exchange: ListAccountExchange::SmgRelay,
@@ -350,7 +368,25 @@ pub fn descriptor() -> PluginDescriptor {
 }
 
 async fn handle_command(command: PluginListCommand) -> PluginListCommandResult {
-    run(&HostHttp, SIMKL_CLIENT_ID, command).await
+    let configured = scryer_plugin_pdk::config::get(CONFIG_CLIENT_ID)
+        .ok()
+        .flatten();
+    run(
+        &HostHttp,
+        client_id(configured.as_deref(), SIMKL_CLIENT_ID),
+        command,
+    )
+    .await
+}
+
+/// The client id to send: the host's configured one when it is set, else
+/// the one built in. An empty result makes every call fail as a
+/// configuration error.
+pub fn client_id<'a>(configured: Option<&'a str>, built_in: &'a str) -> &'a str {
+    configured
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| built_in.trim())
 }
 
 pub async fn run<H: ListHttp>(
@@ -432,21 +468,22 @@ impl<'a, H: ListHttp> Client<'a, H> {
         })
     }
 
-    fn url(&self, path: &str, extended: Option<&str>) -> String {
+    /// `query` is appended as given, after the parameters naming the app.
+    fn url(&self, path: &str, query: &str) -> String {
         let mut url = format!(
             "{API_BASE}{path}?client_id={}&app-name={APP_NAME}&app-version={}",
             encode_component(self.client_id),
             encode_component(APP_VERSION),
         );
-        if let Some(extended) = extended {
-            url.push_str("&extended=");
-            url.push_str(extended);
+        if !query.is_empty() {
+            url.push('&');
+            url.push_str(query);
         }
         url
     }
 
-    fn request(&self, path: &str, extended: Option<&str>) -> PluginHttpRequest {
-        let mut request = get(self.url(path, extended), USER_AGENT, ACCEPT);
+    fn request(&self, path: &str, query: &str) -> PluginHttpRequest {
+        let mut request = get(self.url(path, query), USER_AGENT, ACCEPT);
         request.headers.insert(
             "Authorization".to_string(),
             format!("Bearer {}", self.token),
@@ -454,13 +491,8 @@ impl<'a, H: ListHttp> Client<'a, H> {
         request
     }
 
-    async fn get_json(
-        &self,
-        path: &str,
-        extended: Option<&str>,
-        what: &str,
-    ) -> Result<Value, PluginError> {
-        let response = self.http.send(self.request(path, extended)).await?;
+    async fn get_json(&self, path: &str, query: &str, what: &str) -> Result<Value, PluginError> {
+        let response = self.http.send(self.request(path, query)).await?;
         check_simkl_status(&response, what)?;
         if response.body.iter().all(u8::is_ascii_whitespace) {
             return Ok(Value::Null);
@@ -476,7 +508,7 @@ impl<'a, H: ListHttp> Client<'a, H> {
     ) -> Result<ListPluginFetchResponse, PluginError> {
         let list_name = Some(status.label().to_string());
         let activities = self
-            .get_json("/sync/activities", None, "Simkl activity")
+            .get_json("/sync/activities", "", "Simkl activity")
             .await?;
         let fingerprint = activity_fingerprint(&activities, status, libraries);
         if let Some(fingerprint) = &fingerprint
@@ -490,12 +522,21 @@ impl<'a, H: ListHttp> Client<'a, H> {
             });
         }
 
+        let ids_only = format!("extended={EXTENDED_IDS_ONLY}");
         let mut items = Vec::new();
         for library in libraries {
             let path = format!("/sync/all-items/{}/{}", library.path(), status.key());
             let what = format!("Simkl {} {} list", library.path(), status.key());
-            let body = self.get_json(&path, library.extended(), &what).await?;
-            items.extend(library_items(&body, *library)?);
+            let body = self.get_json(&path, &ids_only, &what).await?;
+            let movies = match library {
+                Library::Anime => {
+                    let narrowed = format!("{ids_only}&anime_type={ANIME_TYPE_MOVIES}");
+                    let body = self.get_json(&path, &narrowed, &what).await?;
+                    simkl_ids(&body, *library)?
+                }
+                _ => BTreeSet::new(),
+            };
+            items.extend(library_items(&body, *library, &movies)?);
         }
         let items = dedupe_and_rank(items, 1);
 
@@ -517,7 +558,7 @@ impl<'a, H: ListHttp> Client<'a, H> {
 
     async fn account(&self) -> Result<ListPluginAccountResponse, PluginError> {
         let body = self
-            .get_json("/users/settings", None, "Simkl account")
+            .get_json("/users/settings", "", "Simkl account")
             .await?;
         let external_user_id =
             json_id(body.get("account").and_then(|account| account.get("id")))
@@ -575,11 +616,20 @@ fn response_error_name(response: &PluginHttpResponse) -> Option<String> {
 /// by the member authorizing Scryer's app again; the rest are not the
 /// member's to fix.
 ///
+/// A 400 `max_items` is Simkl refusing to build a response that large;
+/// retrying the same request gets the same answer.
+///
 /// A 412 is Simkl refusing Scryer's app itself: a wrong or suspended client
 /// id, or a throttling block that lifts with time.
 ///
-/// Anything else, 429 included, follows the shared mapping. A 429 carries
-/// `Retry-After` when it is a member's daily allowance.
+/// Simkl answers two different limits with a 429 and names which in the
+/// body. `rate_limit` is the per-second burst limit, which clears in about a
+/// second, so its `Retry-After` is not used. `user_limit_exceeded` is this
+/// member's daily allowance and `app_limit_exceeded` the app's; both carry
+/// `Retry-After` with the seconds until Simkl resets them at midnight US
+/// Eastern. The host's rate-limited class pauses only the list that hit the
+/// limit, which keeps a member's spent allowance from reading as Simkl being
+/// down. Anything else follows the shared mapping.
 fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
     let status = response.status;
     let name = response_error_name(response);
@@ -588,6 +638,11 @@ fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), P
         None => format!("HTTP {status}"),
     };
     match status {
+        400 if name.as_deref() == Some("max_items") => Err(permanent(format!(
+            "Simkl will not send the {what} because it is too large to build ({detail}); \
+             Scryer already asks for one type and status at a time in the ID-only form, so \
+             this list cannot be followed in full until Simkl raises its limit"
+        ))),
         401 => Err(auth_failed(format!(
             "Simkl rejected the linked account ({detail})"
         ))),
@@ -605,7 +660,33 @@ fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), P
             "Simkl refused Scryer's Simkl app ({detail}); Simkl answers this for a wrong or \
              suspended app id or while it throttles the app"
         ))),
+        429 => Err(simkl_rate_limited(response, name.as_deref())),
         _ => check_status(response, Access::ServerKey, what),
+    }
+}
+
+fn simkl_rate_limited(response: &PluginHttpResponse, name: Option<&str>) -> PluginError {
+    let daily = |whose: &str| {
+        let error = rate_limited(retry_after_seconds(response));
+        let seconds = error.retry_after_seconds.unwrap_or_default();
+        PluginError {
+            public_message: format!(
+                "{whose} daily Simkl request allowance is used up (HTTP 429); Simkl resets it at \
+                 midnight US Eastern, in {seconds} seconds"
+            ),
+            ..error
+        }
+    };
+    match name {
+        Some("rate_limit") => PluginError {
+            public_message: "Simkl's per-second request limit was hit (HTTP 429, rate_limit); \
+                             it clears in about a second"
+                .to_string(),
+            ..rate_limited(Some(BURST_RETRY_SECONDS))
+        },
+        Some("user_limit_exceeded") => daily("this member's"),
+        Some("app_limit_exceeded") => daily("the Simkl app's"),
+        _ => rate_limited(retry_after_seconds(response)),
     }
 }
 
@@ -633,89 +714,93 @@ fn activity_fingerprint(
             parts.push(format!("{}.{field}={stamp}", library.path()));
         }
     }
+    // v2: statuses are read in the ID-only form, so a fingerprint taken
+    // from a richer read forces one fresh read.
     Some(format!(
-        "simkl:v1:{APP_VERSION}:{}:{}",
+        "simkl:v2:{APP_VERSION}:{}:{}",
         status.key(),
         parts.join(",")
     ))
 }
 
-/// The items of one library response. Simkl leaves a library's key out when
-/// it is empty and answers `{}` for an empty status.
-fn library_items(body: &Value, library: Library) -> Result<Vec<ListPluginItem>, PluginError> {
-    let entries = match body {
-        Value::Null => return Ok(Vec::new()),
-        Value::Array(entries) if entries.is_empty() => return Ok(Vec::new()),
+/// The entries of one library response. Simkl leaves a library's key out
+/// when it is empty and answers `{}` for an empty status.
+fn library_entries(body: &Value, library: Library) -> Result<&[Value], PluginError> {
+    match body {
+        Value::Null => Ok(&[]),
+        Value::Array(entries) if entries.is_empty() => Ok(&[]),
         Value::Object(map) => match map.get(library.path()) {
             None | Some(Value::Null) => {
                 if map.contains_key("error") {
                     let name = error_name(body).unwrap_or("unnamed");
                     return Err(permanent(format!("Simkl answered with an error ({name})")));
                 }
-                return Ok(Vec::new());
+                Ok(&[])
             }
-            Some(Value::Array(entries)) => entries,
-            Some(_) => {
-                return Err(permanent(
-                    "the Simkl library response has an unexpected shape",
-                ));
-            }
-        },
-        _ => {
-            return Err(permanent(
+            Some(Value::Array(entries)) => Ok(entries),
+            Some(_) => Err(permanent(
                 "the Simkl library response has an unexpected shape",
-            ));
-        }
-    };
-    Ok(entries
+            )),
+        },
+        _ => Err(permanent(
+            "the Simkl library response has an unexpected shape",
+        )),
+    }
+}
+
+/// The entry's media block: the movie or the show, whichever it carries.
+fn entry_media(entry: &Value, library: Library) -> Option<&Value> {
+    match library {
+        Library::Movies => entry.get("movie").or_else(|| entry.get("show")),
+        Library::Shows | Library::Anime => entry.get("show").or_else(|| entry.get("movie")),
+    }
+}
+
+/// The Simkl ids of every entry in one library response.
+fn simkl_ids(body: &Value, library: Library) -> Result<BTreeSet<String>, PluginError> {
+    Ok(library_entries(body, library)?
         .iter()
-        .filter_map(|entry| entry_item(entry, library))
+        .filter_map(|entry| json_id(entry_media(entry, library)?.get("ids")?.get("simkl")))
+        .collect())
+}
+
+/// The items of one library response. `anime_movies` holds the Simkl ids of
+/// the anime movies in the same status, for the anime library.
+fn library_items(
+    body: &Value,
+    library: Library,
+    anime_movies: &BTreeSet<String>,
+) -> Result<Vec<ListPluginItem>, PluginError> {
+    Ok(library_entries(body, library)?
+        .iter()
+        .filter_map(|entry| entry_item(entry, library, anime_movies))
         .collect())
 }
 
 /// What an entry is: its kind hint, and the kind its TMDb, IMDb and TVDB ids
 /// describe. Anime movies are movies; every other anime entry is anime whose
-/// ids name a TV series. Music videos are not something Scryer manages.
-fn entry_kinds(entry: &Value, library: Library) -> Option<(ListMediaKind, ListMediaKind)> {
+/// ids name a TV series.
+fn entry_kinds(
+    simkl: Option<&str>,
+    library: Library,
+    anime_movies: &BTreeSet<String>,
+) -> (ListMediaKind, ListMediaKind) {
     match library {
-        Library::Movies => Some((ListMediaKind::Movie, ListMediaKind::Movie)),
-        Library::Shows => Some((ListMediaKind::Series, ListMediaKind::Series)),
-        Library::Anime => match anime_type(entry).as_deref() {
-            Some("movie") => Some((ListMediaKind::Movie, ListMediaKind::Movie)),
-            Some("music video") => None,
-            _ => Some((ListMediaKind::Anime, ListMediaKind::Series)),
-        },
-    }
-}
-
-fn anime_type(entry: &Value) -> Option<String> {
-    json_text(entry.get("anime_type")).map(|value| value.to_ascii_lowercase())
-}
-
-/// The one TVDB season an anime entry maps onto. An entry spread across
-/// several seasons, or with no mapping, belongs to the whole series.
-fn mapped_season(entry: &Value) -> Option<i32> {
-    let seasons = entry.get("mapped_tvdb_seasons")?.as_array()?;
-    let mut distinct = BTreeSet::new();
-    for season in seasons {
-        let season = i32::try_from(season.as_i64()?).ok()?;
-        if season < 0 {
-            return None;
+        Library::Movies => (ListMediaKind::Movie, ListMediaKind::Movie),
+        Library::Shows => (ListMediaKind::Series, ListMediaKind::Series),
+        Library::Anime if simkl.is_some_and(|simkl| anime_movies.contains(simkl)) => {
+            (ListMediaKind::Movie, ListMediaKind::Movie)
         }
-        distinct.insert(season);
-    }
-    match distinct.len() {
-        1 => distinct.into_iter().next(),
-        _ => None,
+        Library::Anime => (ListMediaKind::Anime, ListMediaKind::Series),
     }
 }
 
-fn entry_item(entry: &Value, library: Library) -> Option<ListPluginItem> {
-    let media = match library {
-        Library::Movies => entry.get("movie").or_else(|| entry.get("show")),
-        Library::Shows | Library::Anime => entry.get("show").or_else(|| entry.get("movie")),
-    }?;
-    let (kind, id_kind) = entry_kinds(entry, library)?;
+fn entry_item(
+    entry: &Value,
+    library: Library,
+    anime_movies: &BTreeSet<String>,
+) -> Option<ListPluginItem> {
+    let media = entry_media(entry, library)?;
     let ids = media.get("ids");
     let id = |source: &str| ids.and_then(|ids| ids.get(source));
 
@@ -724,6 +809,8 @@ fn entry_item(entry: &Value, library: Library) -> Option<ListPluginItem> {
         .with_imdb(json_text(id("imdb")))
         .with_tvdb(json_id(id("tvdb")));
     let simkl = json_id(id("simkl"));
+    let (kind, id_kind) = entry_kinds(simkl.as_deref(), library, anime_movies);
+    // The ID-only form carries no title or year; a richer one would.
     let title = json_text(media.get("title"));
     let year = json_year(media.get("year"));
 
@@ -756,24 +843,12 @@ fn entry_item(entry: &Value, library: Library) -> Option<ListPluginItem> {
         push(source, json_id(id(source)), Some(ANIME_ID_KIND));
     }
 
-    let (season, format) = match library {
-        Library::Anime => (
-            (kind == ListMediaKind::Anime)
-                .then(|| mapped_season(entry))
-                .flatten(),
-            anime_type(entry),
-        ),
-        _ => (None, None),
-    };
-
     Some(ListPluginItem {
         item_key: key,
         kind_hint: Some(kind),
         title,
         year,
         external_ids,
-        season,
-        format,
         ..ListPluginItem::default()
     })
 }

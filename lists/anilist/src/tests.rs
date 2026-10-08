@@ -1012,3 +1012,81 @@ fn unknown_sources_bad_params_and_health_are_rejected() {
     block_on(fetch(&http, &status_request("REPEATING"))).unwrap();
     assert_eq!(sent(&http).1["variables"]["status"], "REPEATING");
 }
+
+/// `body` with the member's total anime entry count set, or the
+/// `hasNextChunk` flag replaced (`None` drops it).
+fn edited(body: &str, total: Option<u64>, has_next: Option<Option<Value>>) -> String {
+    let mut body: Value = serde_json::from_str(body).unwrap();
+    let collection = body.pointer_mut("/data/MediaListCollection").unwrap();
+    if let Some(total) = total {
+        collection["user"]["statistics"] = json!({ "anime": { "count": total } });
+    }
+    match has_next {
+        Some(Some(value)) => collection["hasNextChunk"] = value,
+        Some(None) => {
+            collection.as_object_mut().unwrap().remove("hasNextChunk");
+        }
+        None => {}
+    }
+    body.to_string()
+}
+
+#[test]
+fn the_collection_query_reads_the_members_total_entry_count() {
+    let http = answering(WATCHING);
+    block_on(fetch(&http, &status_request("current"))).unwrap();
+    let query = sent(&http).1["query"].as_str().unwrap().to_string();
+    assert!(query.contains("statistics { anime { count } }"), "{query}");
+}
+
+#[test]
+fn a_short_status_list_of_a_collection_past_the_cap_fails() {
+    let short = collection(
+        vec![group("Planning", false, vec![entry("PLANNING", 940_001)])],
+        false,
+        &[],
+    );
+    for total in [u64::from(COLLECTION_CAP), u64::from(COLLECTION_CAP) + 4_000] {
+        let http = answering(&edited(&short, Some(total), None));
+        let error = block_on(fetch(&http, &status_request("planning"))).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{total}");
+        assert!(error.public_message.contains("11,000"));
+        assert!(!error.public_message.contains("not found"));
+    }
+
+    // Below the cap, or with no statistics at all, the short list stands.
+    for body in [
+        edited(&short, Some(u64::from(COLLECTION_CAP) - 1), None),
+        short.clone(),
+    ] {
+        let http = answering(&body);
+        let response = block_on(fetch(&http, &status_request("planning"))).unwrap();
+        assert_eq!(keys(&response), vec![("anilist:940001", Some(1))]);
+        assert!(response.fingerprint.is_some());
+    }
+}
+
+#[test]
+fn a_full_chunk_without_a_next_chunk_flag_fails_instead_of_ending_the_list() {
+    let full_chunk: Vec<Value> = (1..=u64::from(PER_CHUNK))
+        .map(|n| entry("COMPLETED", 950_000 + n))
+        .collect();
+    let full = collection(vec![group("Completed", false, full_chunk)], false, &[]);
+    for flag in [None, Some(Value::Null), Some(json!("yes"))] {
+        let http = answering(&edited(&full, None, Some(flag.clone())));
+        let error = block_on(fetch(&http, &status_request("completed"))).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{flag:?}");
+        assert!(!error.public_message.contains("not found"));
+    }
+
+    // A short chunk without the flag is the end of the list.
+    let short = collection(
+        vec![group("Completed", false, vec![entry("COMPLETED", 950_999)])],
+        false,
+        &[],
+    );
+    let http = answering(&edited(&short, None, Some(None)));
+    let response = block_on(fetch(&http, &status_request("completed"))).unwrap();
+    assert_eq!(keys(&response), vec![("anilist:950999", Some(1))]);
+    assert!(response.next_cursor.is_none());
+}

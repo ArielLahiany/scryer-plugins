@@ -49,23 +49,12 @@ const ACTIVITIES: &str = r#"{
   "custom_lists": { "lists": { "all": null } }
 }"#;
 
+// Simkl's ID-only form: each entry is its media block's ids and nothing
+// else.
 const SHOWS: &str = r#"{
   "shows": [
     {
-      "added_to_watchlist_at": "2035-01-02T03:04:05Z",
-      "last_watched_at": null,
-      "user_rated_at": null,
-      "user_rating": null,
-      "status": "watching",
-      "last_watched": null,
-      "next_to_watch": "S01E01",
-      "watched_episodes_count": 0,
-      "total_episodes_count": 10,
-      "not_aired_episodes_count": 0,
       "show": {
-        "title": "Fixture Serial One",
-        "poster": "00/0000fixture1",
-        "year": 2031,
         "ids": {
           "simkl": 9900101,
           "slug": "fixture-serial-one",
@@ -75,37 +64,15 @@ const SHOWS: &str = r#"{
         }
       }
     },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Serial Without Simkl Id",
-        "year": 2032,
-        "ids": { "tvdb": 880102 }
-      }
-    },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Serial One",
-        "year": 2031,
-        "ids": { "simkl": 9900101, "slug": "fixture-serial-one" }
-      }
-    }
+    { "show": { "ids": { "tvdb": 880102 } } },
+    { "show": { "ids": { "simkl": 9900101, "slug": "fixture-serial-one" } } }
   ]
 }"#;
 
 const ANIME: &str = r#"{
   "anime": [
     {
-      "added_to_watchlist_at": "2035-01-05T00:00:00Z",
-      "status": "watching",
-      "watched_episodes_count": 3,
-      "total_episodes_count": 12,
       "show": {
-        "title": "Fixture Anime Season Two",
-        "poster": "00/0000fixture2",
-        "year": 2033,
-        "runtime": 24,
         "ids": {
           "simkl": 9900201,
           "slug": "fixture-anime-season-two",
@@ -117,88 +84,25 @@ const ANIME: &str = r#"{
           "tmdb": "770201",
           "imdb": "tt9900201"
         }
-      },
-      "anime_type": "tv",
-      "mapped_tvdb_seasons": [2],
-      "seasons": [
-        {
-          "number": 1,
-          "episodes": [
-            { "number": 1, "tvdb": { "season": 2, "episode": 1 } }
-          ]
-        }
-      ]
+      }
     },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Anime Season One",
-        "year": 2032,
-        "ids": { "simkl": 9900202, "mal": "990202", "tvdb": "880201" }
-      },
-      "anime_type": "tv",
-      "mapped_tvdb_seasons": [1, 1]
-    },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Anime Split Cour",
-        "year": 2033,
-        "ids": { "simkl": 9900203, "tvdb": "880203" }
-      },
-      "anime_type": "ona",
-      "mapped_tvdb_seasons": [1, 2]
-    },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Anime Specials",
-        "ids": { "simkl": 9900204, "tvdb": "880201" }
-      },
-      "anime_type": "special",
-      "mapped_tvdb_seasons": [0]
-    },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Anime Feature",
-        "year": 2034,
-        "ids": { "simkl": 9900205, "tmdb": "770205", "mal": "990205" }
-      },
-      "anime_type": "movie",
-      "mapped_tvdb_seasons": [1]
-    },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Anime Music Clip",
-        "ids": { "simkl": 9900206 }
-      },
-      "anime_type": "music video"
-    },
-    {
-      "status": "watching",
-      "show": {
-        "title": "Fixture Anime Unmapped",
-        "ids": { "simkl": 9900207, "mal": 990207 }
-      },
-      "anime_type": null
-    }
+    { "show": { "ids": { "simkl": 9900202, "mal": "990202", "tvdb": "880201" } } },
+    { "show": { "ids": { "simkl": 9900205, "tmdb": "770205", "mal": "990205" } } },
+    { "show": { "ids": { "simkl": 9900207, "mal": 990207 } } }
+  ]
+}"#;
+
+/// The same anime status narrowed to anime movies.
+const ANIME_MOVIES: &str = r#"{
+  "anime": [
+    { "show": { "ids": { "simkl": 9900205, "tmdb": "770205", "mal": "990205" } } }
   ]
 }"#;
 
 const MOVIES: &str = r#"{
   "movies": [
     {
-      "added_to_watchlist_at": "2035-01-03T00:00:00Z",
-      "last_watched_at": null,
-      "user_rated_at": null,
-      "user_rating": null,
-      "status": "plantowatch",
       "movie": {
-        "title": "Fixture Feature One",
-        "poster": "00/0000fixture3",
-        "year": 2030,
         "ids": {
           "simkl": 9900301,
           "slug": "fixture-feature-one",
@@ -207,14 +111,7 @@ const MOVIES: &str = r#"{
         }
       }
     },
-    {
-      "status": "plantowatch",
-      "movie": {
-        "title": "Fixture Feature Two",
-        "year": 2031,
-        "ids": { "simkl": 9900302, "tmdb": 770302, "tvdb": "880302" }
-      }
-    }
+    { "movie": { "ids": { "simkl": 9900302, "tmdb": 770302, "tvdb": "880302" } } }
   ]
 }"#;
 
@@ -248,12 +145,26 @@ fn activities_url() -> String {
 }
 
 fn items_url(library: &str, status: &str) -> String {
-    let url = api(&format!("/sync/all-items/{library}/{status}"));
-    if library == "anime" {
-        format!("{url}&extended=full_anime_seasons")
-    } else {
-        url
+    format!(
+        "{}&extended=ids_only",
+        api(&format!("/sync/all-items/{library}/{status}"))
+    )
+}
+
+fn anime_movies_url(status: &str) -> String {
+    format!("{}&anime_type=movies", items_url("anime", status))
+}
+
+/// Every URL one status read sends after the activity read, in order.
+fn library_urls(libraries: &[&str], status: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for library in libraries {
+        urls.push(items_url(library, status));
+        if *library == "anime" {
+            urls.push(anime_movies_url(status));
+        }
     }
+    urls
 }
 
 fn credential() -> ListCredential {
@@ -282,6 +193,7 @@ fn library_http(status: &str, activities: &str) -> RecordedHttp {
         .with(&activities_url(), 200, activities)
         .with(&items_url("shows", status), 200, SHOWS)
         .with(&items_url("anime", status), 200, ANIME)
+        .with(&anime_movies_url(status), 200, ANIME_MOVIES)
         .with(&items_url("movies", status), 200, MOVIES)
 }
 
@@ -442,7 +354,7 @@ fn each_status_and_type_reads_only_its_libraries() {
             let http = library_http(key, ACTIVITIES);
             let response = fetch_ok(&http, &request(key, kind, None));
             let mut expected = vec![activities_url()];
-            expected.extend(libraries.iter().map(|library| items_url(library, key)));
+            expected.extend(library_urls(&libraries, key));
             assert_eq!(http.urls(), expected, "{key} {kind:?}");
             assert!(!response.unchanged);
             assert!(response.next_cursor.is_none());
@@ -500,8 +412,8 @@ fn shows_carry_their_ids_and_a_simkl_key() {
     let show = find(&response.items, "simkl:show:9900101");
     assert_eq!(show.rank, Some(1));
     assert_eq!(show.kind_hint, Some(ListMediaKind::Series));
-    assert_eq!(show.title.as_deref(), Some("Fixture Serial One"));
-    assert_eq!(show.year, Some(2031));
+    assert_eq!(show.title, None, "the ID-only form carries no title");
+    assert_eq!(show.year, None);
     assert_eq!(show.season, None);
     assert_eq!(show.format, None);
     assert_eq!(
@@ -522,9 +434,17 @@ fn shows_carry_their_ids_and_a_simkl_key() {
 }
 
 #[test]
-fn anime_seasons_stay_apart_and_carry_their_tvdb_season() {
+fn anime_seasons_stay_apart_and_anime_movies_are_movies() {
     let http = library_http(SOURCE_WATCHING, ACTIVITIES);
     let response = fetch_ok(&http, &request(SOURCE_WATCHING, Some("anime"), None));
+    assert_eq!(
+        http.urls(),
+        vec![
+            activities_url(),
+            items_url("anime", SOURCE_WATCHING),
+            anime_movies_url(SOURCE_WATCHING),
+        ]
+    );
     let keys: Vec<_> = response
         .items
         .iter()
@@ -535,23 +455,16 @@ fn anime_seasons_stay_apart_and_carry_their_tvdb_season() {
         vec![
             "simkl:anime:9900201",
             "simkl:anime:9900202",
-            "simkl:anime:9900203",
-            "simkl:anime:9900204",
             "simkl:anime:9900205",
             "simkl:anime:9900207",
         ],
-        "every season is its own item and music videos are skipped"
+        "every season is its own item"
     );
 
     let season_two = find(&response.items, "simkl:anime:9900201");
     assert_eq!(season_two.kind_hint, Some(ListMediaKind::Anime));
-    assert_eq!(season_two.season, Some(2));
-    assert_eq!(season_two.format.as_deref(), Some("tv"));
-    assert_eq!(
-        season_two.title.as_deref(),
-        Some("Fixture Anime Season Two")
-    );
-    assert_eq!(season_two.year, Some(2033));
+    assert_eq!(season_two.season, None, "the ID-only form maps no season");
+    assert_eq!(season_two.format, None);
     assert_eq!(
         ids_of(season_two),
         vec![
@@ -566,33 +479,9 @@ fn anime_seasons_stay_apart_and_carry_their_tvdb_season() {
         ]
     );
 
-    let season_one = find(&response.items, "simkl:anime:9900202");
-    assert_eq!(season_one.season, Some(1), "repeats of one season are one");
-    assert_eq!(
-        ids_of(season_one),
-        vec![
-            ("tvdb", "880201", Some("series")),
-            ("simkl", "9900202", Some("anime")),
-            ("mal", "990202", Some("anime")),
-        ]
-    );
-
-    let split = find(&response.items, "simkl:anime:9900203");
-    assert_eq!(
-        split.season, None,
-        "an entry over two seasons is the series"
-    );
-    assert_eq!(split.format.as_deref(), Some("ona"));
-
-    let specials = find(&response.items, "simkl:anime:9900204");
-    assert_eq!(specials.season, Some(0));
-    assert_eq!(specials.format.as_deref(), Some("special"));
-    assert_eq!(specials.year, None);
-
     let feature = find(&response.items, "simkl:anime:9900205");
     assert_eq!(feature.kind_hint, Some(ListMediaKind::Movie));
     assert_eq!(feature.season, None, "a movie has no season");
-    assert_eq!(feature.format.as_deref(), Some("movie"));
     assert_eq!(
         ids_of(feature),
         vec![
@@ -604,21 +493,37 @@ fn anime_seasons_stay_apart_and_carry_their_tvdb_season() {
 
     let unmapped = find(&response.items, "simkl:anime:9900207");
     assert_eq!(unmapped.kind_hint, Some(ListMediaKind::Anime));
-    assert_eq!(unmapped.season, None);
-    assert_eq!(unmapped.format, None);
+    assert_eq!(
+        ids_of(unmapped),
+        vec![
+            ("simkl", "9900207", Some("anime")),
+            ("mal", "990207", Some("anime")),
+        ]
+    );
 }
 
 #[test]
-fn season_mapping_rejects_anything_but_whole_seasons() {
-    let season = |value: &str| mapped_season(&serde_json::from_str(value).unwrap());
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": [3]}"#), Some(3));
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": [0, 0]}"#), Some(0));
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": []}"#), None);
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": [1, 2]}"#), None);
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": [-1]}"#), None);
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": ["2"]}"#), None);
-    assert_eq!(season(r#"{"mapped_tvdb_seasons": null}"#), None);
-    assert_eq!(season(r#"{}"#), None);
+fn a_failed_anime_movie_read_fails_the_whole_status() {
+    let http = RecordedHttp::new()
+        .with(&activities_url(), 200, ACTIVITIES)
+        .with(&items_url("anime", SOURCE_WATCHING), 200, ANIME)
+        .with(&anime_movies_url(SOURCE_WATCHING), 503, "");
+    let error = fetch_err(&http, &request(SOURCE_WATCHING, Some("anime"), None));
+    assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+}
+
+#[test]
+fn every_library_read_is_id_only_and_never_a_full_payload() {
+    for status in Status::ALL {
+        let http = library_http(status.key(), ACTIVITIES);
+        fetch_ok(&http, &request(status.key(), None, None));
+        for url in http.urls().iter().skip(1) {
+            assert!(url.contains("/sync/all-items/"), "{url}");
+            assert!(url.contains("&extended=ids_only"), "{url}");
+            assert!(!url.contains("full"), "{url}");
+            assert!(!url.contains("date_from"), "{url}");
+        }
+    }
 }
 
 #[test]
@@ -630,8 +535,6 @@ fn movies_map_to_movie_items() {
     let first = &response.items[0];
     assert_eq!(first.item_key, "simkl:movie:9900301");
     assert_eq!(first.kind_hint, Some(ListMediaKind::Movie));
-    assert_eq!(first.title.as_deref(), Some("Fixture Feature One"));
-    assert_eq!(first.year, Some(2030));
     assert_eq!(
         ids_of(first),
         vec![
@@ -656,7 +559,7 @@ fn unchanged_activity_skips_the_library_read() {
     let http = library_http(SOURCE_WATCHING, ACTIVITIES);
     let first = fetch_ok(&http, &request(SOURCE_WATCHING, None, None));
     let fingerprint = first.fingerprint.clone().unwrap();
-    assert!(fingerprint.starts_with("simkl:v1:"));
+    assert!(fingerprint.starts_with("simkl:v2:"));
     assert!(!fingerprint.contains(TOKEN));
 
     let again = library_http(SOURCE_WATCHING, ACTIVITIES);
@@ -675,7 +578,7 @@ fn unchanged_activity_skips_the_library_read() {
     assert!(!third.unchanged);
     assert_eq!(third.items, first.items);
     assert_ne!(third.fingerprint.as_deref(), Some(fingerprint.as_str()));
-    assert_eq!(changed.urls().len(), 3);
+    assert_eq!(changed.urls().len(), 4);
 }
 
 #[test]
@@ -767,11 +670,12 @@ fn a_new_member_without_activity_is_still_fingerprinted() {
         .with(&activities_url(), 200, fresh)
         .with(&items_url("shows", SOURCE_DROPPED), 200, "{}")
         .with(&items_url("anime", SOURCE_DROPPED), 200, "{}")
+        .with(&anime_movies_url(SOURCE_DROPPED), 200, "{}")
         .with(&items_url("movies", SOURCE_DROPPED), 200, "{}");
     let first = fetch_ok(&empty, &request(SOURCE_DROPPED, None, None));
     assert!(first.items.is_empty());
     let fingerprint = first.fingerprint.unwrap();
-    assert!(fingerprint.starts_with("simkl:v1:"));
+    assert!(fingerprint.starts_with("simkl:v2:"));
 
     let again = RecordedHttp::new().with(&activities_url(), 200, fresh);
     let second = fetch_ok(&again, &request(SOURCE_DROPPED, None, Some(&fingerprint)));
@@ -887,7 +791,7 @@ fn requests_name_the_app_and_carry_the_token_only_in_a_header() {
     let http = library_http(SOURCE_PLAN_TO_WATCH, ACTIVITIES);
     fetch_ok(&http, &request(SOURCE_PLAN_TO_WATCH, None, None));
     let requests = http.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     for request in requests {
         assert_eq!(request.method.as_deref(), Some("GET"));
         assert!(request.body.is_empty());
@@ -939,7 +843,11 @@ fn upstream_failures_map_to_host_classes() {
             "{status}"
         );
         if status == 429 {
-            assert_eq!(error.retry_after_seconds, Some(120));
+            assert_eq!(
+                error.retry_after_seconds,
+                Some(120),
+                "an unnamed 429 keeps Retry-After"
+            );
         }
         assert_eq!(http.urls(), vec![activities_url()], "{status}");
 
@@ -1134,4 +1042,96 @@ fn unknown_sources_and_health_are_unsupported() {
         other => panic!("unexpected {other:?}"),
     }
     assert!(http.urls().is_empty());
+}
+
+#[test]
+fn the_configured_client_id_wins_over_the_built_in_one() {
+    assert_eq!(
+        client_id(Some(" fixture-config-id "), "fixture-built-in-id"),
+        "fixture-config-id"
+    );
+    assert_eq!(
+        client_id(Some(""), "fixture-built-in-id"),
+        "fixture-built-in-id"
+    );
+    assert_eq!(
+        client_id(None, "fixture-built-in-id"),
+        "fixture-built-in-id"
+    );
+    assert_eq!(client_id(None, SIMKL_CLIENT_ID), "");
+
+    let http = RecordedHttp::new().with(
+        &api("/users/settings").replace(CLIENT_ID, "fixture-config-id"),
+        200,
+        SETTINGS,
+    );
+    block_on(account(
+        &http,
+        client_id(Some("fixture-config-id"), "fixture-built-in-id"),
+        &credential(),
+    ))
+    .unwrap();
+    assert!(http.urls()[0].contains("client_id=fixture-config-id"));
+
+    let untouched = RecordedHttp::new();
+    let error = block_on(account(
+        &untouched,
+        client_id(None, SIMKL_CLIENT_ID),
+        &credential(),
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(untouched.urls().is_empty());
+}
+
+fn limited(body: &str, retry_after: &str) -> PluginError {
+    let http = RecordedHttp::new()
+        .with(&activities_url(), 200, ACTIVITIES)
+        .with_headers(
+            &items_url("shows", SOURCE_WATCHING),
+            429,
+            &[("Retry-After", retry_after)],
+            body,
+        );
+    fetch_err(&http, &request(SOURCE_WATCHING, Some("shows"), None))
+}
+
+#[test]
+fn a_burst_429_retries_shortly_and_ignores_retry_after() {
+    let error = limited(r#"{"error":"rate_limit","code":429}"#, "3600");
+    assert_eq!(error.code, PluginErrorCode::RateLimited);
+    assert_eq!(error.retry_after_seconds, Some(BURST_RETRY_SECONDS));
+    assert!(error.public_message.contains("per-second"));
+}
+
+#[test]
+fn a_spent_daily_allowance_waits_for_the_reset_and_names_whose_it_is() {
+    let member = limited(r#"{"error":"user_limit_exceeded","code":429}"#, "5400");
+    assert_eq!(member.code, PluginErrorCode::RateLimited);
+    assert_eq!(member.retry_after_seconds, Some(5400));
+    assert!(member.public_message.contains("this member's daily"));
+    assert!(!member.public_message.contains("unavailable"));
+    assert!(!member.public_message.contains(TOKEN));
+
+    let app = limited(r#"{"error":"app_limit_exceeded","code":429}"#, "600");
+    assert_eq!(app.code, PluginErrorCode::RateLimited);
+    assert_eq!(app.retry_after_seconds, Some(600));
+    assert!(app.public_message.contains("app's daily"));
+}
+
+#[test]
+fn a_status_too_large_to_build_is_a_permanent_failure_that_says_why() {
+    let http = RecordedHttp::new()
+        .with(&activities_url(), 200, ACTIVITIES)
+        .with(
+            &items_url("shows", SOURCE_COMPLETED),
+            400,
+            r#"{"error":"max_items","code":400,"message":"Too many episodes: fixture"}"#,
+        );
+    let error = fetch_err(&http, &request(SOURCE_COMPLETED, Some("shows"), None));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("max_items"));
+    assert!(error.public_message.contains("too large"));
+    assert!(!error.public_message.contains("not found"));
+    assert!(!error.public_message.contains("Too many episodes"));
 }
