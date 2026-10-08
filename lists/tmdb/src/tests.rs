@@ -255,14 +255,21 @@ fn list_pages_through_the_cursor_with_global_ranks() {
 
 #[test]
 fn bearer_tokens_go_in_the_header_not_the_url() {
-    let http =
-        RecordedHttp::new().with(&format!("{API_BASE}/list/8100001?page=1"), 200, LIST_PAGE_1);
-    ok(fetch(
+    // A v4 read access token reads a public list through v4, which pages
+    // with `total_pages`.
+    let http = RecordedHttp::new().with(
+        &format!("{API_V4_BASE}/list/8100001?page=1"),
+        200,
+        LIST_PAGE_1,
+    );
+    let first = ok(fetch(
         &http,
         Some(BEARER),
         request("list", &[("list_id", "8100001")], None),
     ));
+    assert_eq!(first.next_cursor.as_deref(), Some("2"));
     let sent = &http.requests()[0];
+    assert_eq!(sent.url, format!("{API_V4_BASE}/list/8100001?page=1"));
     assert!(!sent.url.contains("api_key"));
     assert_eq!(
         sent.headers.get("Authorization").map(String::as_str),
@@ -409,10 +416,10 @@ fn person_crew_narrows_to_one_department() {
 
 #[test]
 fn company_and_keyword_use_discover_with_a_page_cap() {
-    let body = r#"{"page": 50, "total_pages": 50, "total_results": 1000,
+    let body = r#"{"page": 99, "total_pages": 99, "total_results": 1980,
       "results": [{"id": 990401, "name": "Fixture Company Serial", "first_air_date": "2033-01-01"}]}"#;
     let http = RecordedHttp::new()
-        .with(&url("/discover/tv?with_companies=77&sort_by=first_air_date.desc&include_adult=false&page=50"), 200, body)
+        .with(&url("/discover/tv?with_companies=77&sort_by=first_air_date.desc&include_adult=false&page=99"), 200, body)
         .with(&url("/discover/movie?with_keywords=9951&sort_by=primary_release_date.desc&include_adult=false&page=1"), 200, body);
 
     let company = ok(fetch(
@@ -421,7 +428,7 @@ fn company_and_keyword_use_discover_with_a_page_cap() {
         request(
             "company",
             &[("company_id", "77"), ("kind", "series")],
-            Some("50"),
+            Some("99"),
         ),
     ));
     assert!(
@@ -429,7 +436,7 @@ fn company_and_keyword_use_discover_with_a_page_cap() {
         "page {MAX_PAGES} is the last one followed"
     );
     assert_eq!(company.items[0].item_key, "tmdb:series:990401");
-    assert_eq!(company.items[0].rank, Some(981));
+    assert_eq!(company.items[0].rank, Some(1961));
     assert_eq!(company.total_hint, Some(MAX_PAGES * 20));
 
     let keyword = ok(fetch(
@@ -467,7 +474,7 @@ fn public_sources_past_the_page_cap_fail_instead_of_being_cut_short() {
     ] {
         let error = err(fetch(&http, Some(KEY), request));
         assert_eq!(error.code, PluginErrorCode::Permanent);
-        assert!(error.public_message.contains("1000 titles"));
+        assert!(error.public_message.contains("1980 titles"));
     }
     assert_eq!(http.requests().len(), 2, "one page read per source");
 }
@@ -782,7 +789,7 @@ fn watchlist_pages_movies_then_shows_with_the_member_token() {
 
 #[test]
 fn favorites_page_one_kind_by_number() {
-    let shows = r#"{"page": 1, "total_pages": 50, "total_results": 1000, "results": [
+    let shows = r#"{"page": 1, "total_pages": 99, "total_results": 1980, "results": [
       {"id": 990611, "name": "Fixture Favorite Serial", "first_air_date": "2028-03-03"}
     ]}"#;
     let page = |page| {
@@ -809,13 +816,13 @@ fn favorites_page_one_kind_by_number() {
     let last = ok(fetch(
         &http,
         None,
-        personal_request("favorites", &[("kind", "series")], Some("50")),
+        personal_request("favorites", &[("kind", "series")], Some("99")),
     ));
     assert!(
         last.next_cursor.is_none(),
         "page {MAX_PAGES} is the last one followed"
     );
-    assert_eq!(last.items[0].rank, Some(981));
+    assert_eq!(last.items[0].rank, Some(1961));
     assert_member_call(&http.requests()[0], &page(1));
 
     // Past the cap the collection fails rather than being cut short, which
@@ -831,6 +838,8 @@ fn favorites_page_one_kind_by_number() {
         personal_request("favorites", &[("kind", "series")], None),
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("1980 titles"));
+    assert!(!error.public_message.contains("not found"));
     let too_long_for_half = RecordedHttp::new().with(
         &account_url("/movie/favorites?sort_by=created_at.desc&page=1"),
         200,
@@ -842,6 +851,12 @@ fn favorites_page_one_kind_by_number() {
         personal_request("favorites", &[], None),
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(
+        error.public_message.contains("980 movies")
+            && error.public_message.contains("movies and shows together"),
+        "the per-kind limit is named: {}",
+        error.public_message
+    );
 
     // With both kinds, an empty movie side hands straight over to shows.
     let empty = RecordedHttp::new().with(
@@ -940,7 +955,11 @@ fn account_list_reads_the_members_list_with_their_token() {
 fn public_sources_ignore_a_member_credential() {
     let http = RecordedHttp::new()
         .with(&url("/list/8100001?page=1"), 200, LIST_PAGE_1)
-        .with(&format!("{API_BASE}/list/8100001?page=1"), 200, LIST_PAGE_1);
+        .with(
+            &format!("{API_V4_BASE}/list/8100001?page=1"),
+            200,
+            LIST_PAGE_1,
+        );
     let with_member = |key| {
         let mut public = request("list", &[("list_id", "8100001")], None);
         public.credential = Some(member());
@@ -957,7 +976,7 @@ fn public_sources_ignore_a_member_credential() {
         Some(format!("Bearer {BEARER}").as_str())
     );
     for request in &sent {
-        assert!(request.url.starts_with(API_BASE));
+        assert!(request.url.starts_with("https://api.themoviedb.org/"));
         assert!(!request.url.contains(MEMBER_TOKEN));
         assert!(
             request
@@ -1167,7 +1186,7 @@ fn personal_sources_need_a_linked_account() {
             }),
         ] {
             let error = personal_with(source, params, credential);
-            assert_eq!(error.code, PluginErrorCode::InvalidConfig, "{source}");
+            assert_eq!(error.code, PluginErrorCode::AuthFailed, "{source}");
             assert_no_secrets(&error);
         }
     }
@@ -1180,7 +1199,7 @@ fn personal_sources_need_a_linked_account() {
             }
         ))
         .code,
-        PluginErrorCode::InvalidConfig
+        PluginErrorCode::AuthFailed
     );
     assert_eq!(
         personal_with("account_list", &[], Some(member())).code,
@@ -1218,4 +1237,262 @@ fn both_kind_cursors_are_validated() {
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(http.urls().is_empty());
+}
+
+/// A v3 list page without `total_pages`, holding `count` movies whose ids
+/// start at `first_id`, with `item_count` when given.
+fn v3_list_page(first_id: u32, count: u32, item_count: Option<u32>) -> String {
+    let items: Vec<String> = (first_id..first_id + count)
+        .map(|id| {
+            format!(
+                r#"{{"id": {id}, "media_type": "movie", "title": "Fixture Shelf Feature", "release_date": "2030-01-01"}}"#
+            )
+        })
+        .collect();
+    let count_field = item_count
+        .map(|count| format!(r#""item_count": {count}, "#))
+        .unwrap_or_default();
+    format!(
+        r#"{{"id": 8100002, "name": "Fixture Untotalled", {count_field}"items": [{}]}}"#,
+        items.join(",")
+    )
+}
+
+#[test]
+fn a_v3_list_without_total_pages_pages_by_its_item_count() {
+    let http = RecordedHttp::new()
+        .with(
+            &url("/list/8100002?page=1"),
+            200,
+            &v3_list_page(990800, 20, Some(23)),
+        )
+        .with(
+            &url("/list/8100002?page=2"),
+            200,
+            &v3_list_page(990820, 3, Some(23)),
+        );
+    let list = |cursor: Option<&str>| {
+        fetch(
+            &http,
+            Some(KEY),
+            request("list", &[("list_id", "8100002")], cursor),
+        )
+    };
+    let first = ok(list(None));
+    assert_eq!(
+        first.next_cursor.as_deref(),
+        Some("2"),
+        "23 items do not fit on one page"
+    );
+    assert_eq!(first.total_hint, Some(23));
+    let second = ok(list(first.next_cursor.as_deref()));
+    assert!(second.next_cursor.is_none());
+    assert_eq!(second.items[0].rank, Some(21));
+    assert_eq!(second.items.len(), 3);
+
+    // A list served whole on its first page ends there.
+    let whole = RecordedHttp::new().with(
+        &url("/list/8100002?page=1"),
+        200,
+        &v3_list_page(990800, 23, Some(23)),
+    );
+    let response = ok(fetch(
+        &whole,
+        Some(KEY),
+        request("list", &[("list_id", "8100002")], None),
+    ));
+    assert!(response.next_cursor.is_none());
+    assert_eq!(response.items.len(), 23);
+
+    // A short list with no count at all is a single page.
+    let short = RecordedHttp::new().with(
+        &url("/list/8100002?page=1"),
+        200,
+        &v3_list_page(990800, 4, None),
+    );
+    let response = ok(fetch(
+        &short,
+        Some(KEY),
+        request("list", &[("list_id", "8100002")], None),
+    ));
+    assert!(response.next_cursor.is_none());
+    assert_eq!(response.items.len(), 4);
+}
+
+#[test]
+fn a_v3_list_that_cannot_vouch_for_its_end_fails() {
+    let fails = |cursor: Option<&str>, page: u32, body: String| {
+        let http =
+            RecordedHttp::new().with(&url(&format!("/list/8100002?page={page}")), 200, &body);
+        let error = err(fetch(
+            &http,
+            Some(KEY),
+            request("list", &[("list_id", "8100002")], cursor),
+        ));
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(
+            !error.public_message.contains("not found"),
+            "the list is not gone: {}",
+            error.public_message
+        );
+        error
+    };
+    // An empty page before every item was read.
+    fails(Some("2"), 2, v3_list_page(990820, 0, Some(23)));
+    // A full page with no count may have more behind it.
+    fails(None, 1, v3_list_page(990800, 20, None));
+    // A count past the cap fails on the first page.
+    let error = fails(None, 1, v3_list_page(990800, 20, Some(MAX_PAGES * 20 + 1)));
+    assert!(error.public_message.contains("1980 titles"));
+}
+
+#[test]
+fn cursors_past_the_page_cap_are_never_sent() {
+    let http = RecordedHttp::new();
+    let past = (MAX_PAGES + 1).to_string();
+    for request in [
+        request("list", &[("list_id", "8100001")], Some(&past)),
+        request("company", &[("company_id", "77")], Some(&past)),
+        request("keyword", &[("keyword_id", "9951")], Some(&past)),
+        personal_request("favorites", &[("kind", "movie")], Some(&past)),
+        personal_request("account_list", &[("list_id", "8200001")], Some(&past)),
+        personal_request(
+            "watchlist",
+            &[],
+            Some(&format!("series:{}:0", MAX_PAGES / 2 + 1)),
+        ),
+        personal_request("watchlist", &[], Some("movie:4294967295:4294967295")),
+    ] {
+        let source = request.source_type.clone();
+        let error = err(fetch(&http, Some(KEY), request));
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{source}");
+    }
+    assert!(http.urls().is_empty());
+
+    // The last allowed both-kinds page still reads, and huge rank bases
+    // saturate rather than overflow.
+    let last = account_url(&format!(
+        "/tv/watchlist?sort_by=created_at.desc&page={}",
+        MAX_PAGES / 2
+    ));
+    let http = RecordedHttp::new().with(
+        &last,
+        200,
+        r#"{"page": 49, "total_pages": 49, "results": [{"id": 990901, "name": "Fixture Late Serial"}]}"#,
+    );
+    let response = ok(fetch(
+        &http,
+        None,
+        personal_request(
+            "watchlist",
+            &[],
+            Some(&format!("series:{}:4294967290", MAX_PAGES / 2)),
+        ),
+    ));
+    assert_eq!(response.items[0].rank, Some(u32::MAX));
+    assert!(response.next_cursor.is_none());
+}
+
+#[test]
+fn recommendations_past_the_page_cap_fail_instead_of_being_cut_short() {
+    let page = |kind: &str, pages: u32| {
+        (
+            account_url(&format!("/{kind}/recommendations?page=1")),
+            format!(
+                r#"{{"page": 1, "total_pages": {pages}, "total_results": 9999, "results": [
+                  {{"id": 990951, "title": "Fixture Suggested"}}]}}"#
+            ),
+        )
+    };
+    let (at_cap_url, at_cap) = page("movie", MAX_PAGES);
+    let http = RecordedHttp::new().with(&at_cap_url, 200, &at_cap);
+    let response = ok(fetch(
+        &http,
+        None,
+        personal_request("recommendations", &[("kind", "movie")], None),
+    ));
+    assert_eq!(response.next_cursor.as_deref(), Some("2"));
+
+    let (past_url, past) = page("movie", MAX_PAGES + 1);
+    let http = RecordedHttp::new().with(&past_url, 200, &past);
+    let error = err(fetch(
+        &http,
+        None,
+        personal_request("recommendations", &[("kind", "movie")], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("1980 titles"));
+
+    let (half_url, half) = page("movie", MAX_PAGES / 2 + 1);
+    let http = RecordedHttp::new().with(&half_url, 200, &half);
+    let error = err(fetch(
+        &http,
+        None,
+        personal_request("recommendations", &[], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("980 movies"));
+}
+
+#[test]
+fn a_refused_or_missing_account_collection_never_reads_as_gone() {
+    let collections = [
+        account_url("/movie/watchlist?sort_by=created_at.desc&page=1"),
+        account_url("/movie/favorites?sort_by=created_at.desc&page=1"),
+        account_url("/movie/rated?sort_by=created_at.desc&page=1"),
+        account_url("/movie/recommendations?page=1"),
+    ];
+    let sources = ["watchlist", "favorites", "rated", "recommendations"];
+    for (address, source) in collections.iter().zip(sources) {
+        for (status, code) in [
+            (403, PluginErrorCode::AuthFailed),
+            (404, PluginErrorCode::Permanent),
+            (410, PluginErrorCode::Permanent),
+        ] {
+            let http = RecordedHttp::new().with(address, status, r#"{"status_code": 34}"#);
+            let error = err(fetch(
+                &http,
+                None,
+                personal_request(source, &[("kind", "movie")], None),
+            ));
+            assert_eq!(error.code, code, "{source} {status}");
+            assert!(
+                !error.public_message.contains("not found"),
+                "{source} {status}: {}",
+                error.public_message
+            );
+            assert_no_secrets(&error);
+        }
+    }
+
+    // The list index the account operation reads is the member's own too.
+    for (status, code) in [
+        (403, PluginErrorCode::AuthFailed),
+        (404, PluginErrorCode::Permanent),
+    ] {
+        let http = RecordedHttp::new().with(&account_url("/lists?page=1"), status, "");
+        let error = err(account(&http, member()));
+        assert_eq!(error.code, code, "{status}");
+        assert!(!error.public_message.contains("not found"), "{status}");
+    }
+}
+
+#[test]
+fn an_unreadable_first_list_leaves_the_account_unnamed_by_it() {
+    let lists =
+        r#"{"page": 1, "total_pages": 1, "results": [{"id": 8200001, "name": "Fixture Shelf"}]}"#;
+    for (status, body) in [
+        (500, ""),
+        (404, r#"{"status_code": 34}"#),
+        (401, r#"{"status_code": 39}"#),
+        (200, "not json"),
+    ] {
+        let http = RecordedHttp::new()
+            .with(&account_url("/lists?page=1"), 200, lists)
+            .with(&v4("/list/8200001?page=1"), status, body);
+        let linked = ok(account(&http, member()));
+        assert_eq!(linked.username, "fixture-member", "{status}");
+        assert!(linked.display_name.is_none() && linked.avatar_url.is_none());
+        assert_eq!(linked.owned_lists.len(), 1);
+    }
 }
