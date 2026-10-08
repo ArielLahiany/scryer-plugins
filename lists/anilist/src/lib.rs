@@ -13,7 +13,9 @@
 //! AniList serves at most the 11,000 most recently updated entries of a
 //! collection. A read that reaches that cap fails instead of returning a
 //! shortened list, because the host would take every missing title as having
-//! left the list.
+//! left the list. A status list is filtered from the whole collection, so
+//! every chunk also reads the member's total anime entry count and fails
+//! once that reaches the cap, however short the status list itself is.
 //!
 //! Entries carry the AniList id and, when AniList knows it, the MyAnimeList
 //! id. Both are kindless: the metadata gateway maps them onto TVDB and TMDb.
@@ -126,6 +128,7 @@ const COLLECTION_QUERY: &str = r#"query ($userId: Int, $userName: String, $statu
     user {
       name
       mediaListOptions { animeList { customLists } }
+      statistics { anime { count } }
     }
     lists {
       name
@@ -543,13 +546,30 @@ pub async fn fetch<H: ListHttp>(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let has_next = collection
-        .get("hasNextChunk")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let in_chunk = distinct_entries(groups);
+    let has_next = match collection.get("hasNextChunk").and_then(Value::as_bool) {
+        Some(has_next) => has_next,
+        // Without the flag a full chunk may have more after it, and ending
+        // the list here would read every later entry as having left it.
+        None if in_chunk >= PER_CHUNK => {
+            return Err(permanent(
+                "AniList answered a full chunk without saying whether another follows, so \
+                 Scryer cannot tell whether the list is complete",
+            ));
+        }
+        None => false,
+    };
 
-    let read_so_far = ((chunk - 1) * PER_CHUNK).saturating_add(distinct_entries(groups));
-    if read_so_far >= COLLECTION_CAP || (has_next && chunk >= MAX_CHUNKS) {
+    // The cap applies to the whole collection, before a status filter, so a
+    // member past it may be missing entries from any status list.
+    let total = user
+        .and_then(|user| user.pointer("/statistics/anime/count"))
+        .and_then(Value::as_u64);
+    let read_so_far = ((chunk - 1) * PER_CHUNK).saturating_add(in_chunk);
+    if total.is_some_and(|total| total >= u64::from(COLLECTION_CAP))
+        || read_so_far >= COLLECTION_CAP
+        || (has_next && chunk >= MAX_CHUNKS)
+    {
         return Err(permanent(
             "this AniList collection reached AniList's 11,000-entry limit, so Scryer cannot \
              read all of it",
