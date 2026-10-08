@@ -237,9 +237,12 @@ fn status_of(source_type: &str) -> Result<(&'static str, &'static str), PluginEr
         .ok_or_else(|| unsupported_source(source_type))
 }
 
+/// One page of a status list. `nsfw=true` keeps adult entries in it:
+/// MyAnimeList leaves them out by default, and a list missing them would make
+/// them look like they left.
 fn list_request_url(status: &str, offset: u32) -> String {
     format!(
-        "{API_BASE}/users/@me/animelist?status={status}&sort=anime_title&fields={ANIME_FIELDS}&limit={PAGE_LIMIT}&offset={offset}"
+        "{API_BASE}/users/@me/animelist?status={status}&sort=anime_title&fields={ANIME_FIELDS}&limit={PAGE_LIMIT}&offset={offset}&nsfw=true"
     )
 }
 
@@ -265,7 +268,7 @@ pub async fn fetch<H: ListHttp>(
         .and_then(Value::as_array)
         .ok_or_else(|| permanent("the MyAnimeList list response has no entries"))?;
     let items: Vec<ListPluginItem> = entries.iter().filter_map(to_item).collect();
-    let next = next_offset(&body, offset)?;
+    let next = next_offset(&body, offset, entries.len())?;
     let list_name = Some(format!("MyAnimeList {label}"));
     if offset == 0 && next.is_none() {
         return Ok(single_page(
@@ -290,10 +293,13 @@ pub async fn fetch<H: ListHttp>(
 
 /// The offset of the next page when MyAnimeList says there is one. Only the
 /// offset of MyAnimeList's `paging.next` address is used, so every request
-/// stays on the API host with this plugin's own parameters. A list longer
-/// than the page cap fails rather than being cut short, because a truncated
-/// list would make its tail look like it left.
-fn next_offset(body: &Value, offset: u32) -> Result<Option<u32>, PluginError> {
+/// stays on the API host with this plugin's own parameters. That offset must
+/// move past this page without skipping any of it: one that stays put, goes
+/// back, or jumps beyond the entries just read fails, since following it
+/// would repeat or silently drop entries. A list longer than the page cap
+/// fails rather than being cut short, because a truncated list would make
+/// its tail look like it left.
+fn next_offset(body: &Value, offset: u32, read: usize) -> Result<Option<u32>, PluginError> {
     let Some(next) = body
         .get("paging")
         .and_then(|paging| paging.get("next"))
@@ -302,9 +308,12 @@ fn next_offset(body: &Value, offset: u32) -> Result<Option<u32>, PluginError> {
     else {
         return Ok(None);
     };
+    let read = u32::try_from(read).unwrap_or(u32::MAX);
     let next = query_offset(next)
-        .filter(|next| *next > offset)
-        .unwrap_or(offset + PAGE_LIMIT);
+        .filter(|next| *next > offset && *next <= offset.saturating_add(read))
+        .ok_or_else(|| {
+            permanent("the MyAnimeList list gave a next page that does not follow this one")
+        })?;
     if next >= PAGE_LIMIT * MAX_PAGES {
         return Err(permanent(format!(
             "the MyAnimeList list has more than {} entries, more than Scryer follows",

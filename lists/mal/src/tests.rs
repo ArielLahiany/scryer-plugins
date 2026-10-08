@@ -14,7 +14,7 @@ const TOKEN: &str = "fixture-member-access-token-0123456789";
 fn list_url(status: &str, offset: u32) -> String {
     format!(
         "https://api.myanimelist.net/v2/users/@me/animelist?status={status}&sort=anime_title\
-         &fields=media_type,start_date,start_season,status,mean,genres&limit=1000&offset={offset}"
+         &fields=media_type,start_date,start_season,status,mean,genres&limit=1000&offset={offset}&nsfw=true"
     )
 }
 
@@ -86,6 +86,13 @@ fn entry(id: u32, title: &str, media_type: &str) -> String {
             "media_type": "{media_type}", "start_date": "2031-04-05",
             "start_season": {{"year": 2031, "season": "spring"}}, "status": "finished_airing"}}}}"#
     )
+}
+
+/// A full page of `count` entries whose ids start at `first_id`.
+fn entries(first_id: u32, count: u32) -> Vec<String> {
+    (first_id..first_id + count)
+        .map(|id| entry(id, "Fixture Paged Title", "tv"))
+        .collect()
 }
 
 fn page(entries: &[String], next: Option<&str>) -> String {
@@ -359,10 +366,7 @@ fn a_single_page_list_is_fingerprinted() {
 #[test]
 fn pages_follow_paging_next_with_global_ranks() {
     let first_page = page(
-        &[
-            entry(990301, "Fixture Paged One", "tv"),
-            entry(990302, "Fixture Paged Two", "movie"),
-        ],
+        &entries(1_000_000, PAGE_LIMIT),
         Some(
             "https://api.myanimelist.net/v2/users/@me/animelist?offset=1000&status=watching&limit=1000",
         ),
@@ -370,7 +374,7 @@ fn pages_follow_paging_next_with_global_ranks() {
     // MyAnimeList's next address is never followed as given: only its offset
     // is read, so a stray host or parameter cannot leave the API.
     let second_page = page(
-        &[entry(990303, "Fixture Paged Three", "ona")],
+        &entries(1_001_000, PAGE_LIMIT),
         Some("https://elsewhere.example.test/v2/users/@me/animelist?limit=5&offset=2000"),
     );
     let last_page = page(&[entry(990304, "Fixture Paged Four", "tv")], None);
@@ -386,10 +390,9 @@ fn pages_follow_paging_next_with_global_ranks() {
         "a paged list has no fingerprint"
     );
     assert_eq!(first.total_hint, None);
-    assert_eq!(
-        first.items.iter().map(|item| item.rank).collect::<Vec<_>>(),
-        vec![Some(1), Some(2)]
-    );
+    assert_eq!(first.items.len(), 1000);
+    assert_eq!(first.items[0].rank, Some(1));
+    assert_eq!(first.items[999].rank, Some(1000));
 
     let second = ok(fetch(
         &http,
@@ -417,25 +420,59 @@ fn pages_follow_paging_next_with_global_ranks() {
 }
 
 #[test]
-fn a_next_page_without_a_usable_offset_advances_by_a_full_page() {
+fn a_short_page_continues_right_after_its_last_entry() {
     let first_page = page(
-        &[entry(990401, "Fixture Odd Paging", "tv")],
-        Some("https://api.myanimelist.net/v2/users/@me/animelist?offset=0"),
+        &entries(990401, 3),
+        Some("https://api.myanimelist.net/v2/users/@me/animelist?offset=3"),
     );
     let http = RecordedHttp::new().with(&list_url("dropped", 0), 200, &first_page);
     let first = ok(fetch(&http, request("status:dropped", None)));
-    assert_eq!(first.next_cursor.as_deref(), Some("1000"));
+    assert_eq!(first.next_cursor.as_deref(), Some("3"));
+}
+
+#[test]
+fn a_next_page_that_does_not_follow_this_one_fails() {
+    // An offset that stays put, goes back, skips entries or is missing would
+    // repeat or drop titles, so the sync fails instead of guessing.
+    for next in [
+        "https://api.myanimelist.net/v2/users/@me/animelist?offset=0",
+        "https://api.myanimelist.net/v2/users/@me/animelist?offset=1000",
+        "https://api.myanimelist.net/v2/users/@me/animelist?offset=5000",
+        "https://api.myanimelist.net/v2/users/@me/animelist?limit=1000",
+        "https://api.myanimelist.net/v2/users/@me/animelist?offset=fixture",
+    ] {
+        let http = RecordedHttp::new().with(
+            &list_url("dropped", 0),
+            200,
+            &page(&entries(990451, 3), Some(next)),
+        );
+        let error = err(fetch(&http, request("status:dropped", None)));
+        assert_eq!(error.code, PluginErrorCode::Permanent, "{next}");
+        assert!(!error.public_message.contains("not found"), "{next}");
+    }
+
+    // A jump past the page just read, from a later page.
+    let http = RecordedHttp::new().with(
+        &list_url("dropped", 1000),
+        200,
+        &page(
+            &entries(990461, PAGE_LIMIT),
+            Some("https://api.myanimelist.net/v2/users/@me/animelist?offset=3000"),
+        ),
+    );
+    let error = err(fetch(&http, request("status:dropped", Some("1000"))));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
 }
 
 #[test]
 fn lists_beyond_the_page_cap_fail_instead_of_being_cut_short() {
     let last_followed = (MAX_PAGES - 1) * PAGE_LIMIT;
-    assert!(MAX_PAGES < 100, "below the host's hundred-page ceiling");
+    const { assert!(MAX_PAGES < 100, "below the host's hundred-page ceiling") };
     let http = RecordedHttp::new().with(
         &list_url("completed", last_followed),
         200,
         &page(
-            &[entry(990501, "Fixture Long Tail", "tv")],
+            &entries(990501, PAGE_LIMIT),
             Some(&format!(
                 "https://api.myanimelist.net/v2/users/@me/animelist?offset={}",
                 last_followed + PAGE_LIMIT
