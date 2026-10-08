@@ -1,19 +1,20 @@
 [package]
-name = "plex-list-provider"
-version = "1.1.0"
+name = "anilist-list-provider"
+version = "1.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Plex watchlist list provider over the public watchlist RSS feed or a linked Plex account"
+description = "AniList list provider for a linked member's status and custom anime lists"
 
 [package.metadata.scryer]
 official = true
-plugin_id = "plex-list"
+plugin_id = "anilist-list"
 catalog_versions = ["v3"]
-# The first Scryer release that links members' own accounts for list
-# providers. An older host cannot hand this plugin a member credential.
+# The first Scryer release that links member accounts. The list family
+# arrived in 0.21.11, but personal sources need the 0.21.15 account flow and
+# the member credential it hands this plugin.
 min_scryer_version = "0.21.15"
-docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/plex"
-source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/plex"
+docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/anilist"
+source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/anilist"
 
 [lib]
 crate-type = ["cdylib"]
@@ -27,7 +28,6 @@ wit-bindgen = { version = "0.61", features = ["async"] }
 
 [dev-dependencies]
 list-provider-common = { path = "../list-common", features = ["testing"] }
-regex = "1"
 
 [profile.plugin-release]
 inherits = "release"
