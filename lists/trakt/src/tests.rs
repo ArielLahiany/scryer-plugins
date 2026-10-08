@@ -191,7 +191,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
     assert_eq!(
         list.auth,
         ListProviderAuth::MemberAccount {
-            flow: ListAccountFlow::AuthorizationCode { pkce: false },
+            flow: ListAccountFlow::AuthorizationCode { pkce: true },
             exchange: ListAccountExchange::SmgRelay,
             byo_app: true,
             scopes: Vec::new(),
@@ -738,6 +738,18 @@ fn errors_map_to_host_failure_classes() {
     ] {
         assert_eq!(app_rejected.code, PluginErrorCode::InvalidConfig);
     }
+    for refused in [public(403, &[], r#""Forbidden""#), member(403)] {
+        assert!(refused.public_message.contains("client id"));
+        assert!(refused.public_message.contains("private"));
+    }
+    let deactivated = member(410);
+    assert_eq!(deactivated.code, PluginErrorCode::AuthFailed);
+    assert!(deactivated.public_message.contains("deactivated"));
+    assert!(!deactivated.public_message.contains("not found"));
+    assert!(!deactivated.public_message.contains(TOKEN));
+    let gone_owner = public(410, &[], "");
+    assert_eq!(gone_owner.code, PluginErrorCode::Permanent);
+    assert!(!gone_owner.public_message.contains("not found"));
     let missing = public(404, &[], "");
     assert_eq!(missing.code, PluginErrorCode::Permanent);
     assert!(missing.public_message.contains("not found"));
@@ -955,7 +967,7 @@ fn watched_and_collection_read_the_members_titles_by_type() {
        "movie": {"title": "Fixture Feature Nu", "year": 2029,
                  "ids": {"trakt": 900701, "slug": "fixture-feature-nu-2029", "imdb": "tt0000701", "tmdb": 990701}}}
     ]"#;
-    let watched_url = api("/users/me/watched/shows?page=1&limit=250");
+    let watched_url = api("/users/me/watched/shows?extended=noseasons&page=1&limit=250");
     let collected_url = api("/users/me/collection/movies?page=1&limit=250");
     let http = RecordedHttp::new()
         .with_headers(
@@ -1002,4 +1014,191 @@ fn watched_and_collection_read_the_members_titles_by_type() {
         PluginErrorCode::AuthFailed
     );
     assert!(untouched.urls().is_empty());
+}
+
+/// `count` movie entries with distinct ids, starting at `first`.
+fn movie_entries(first: u32, count: u32) -> String {
+    let entries: Vec<String> = (first..first + count)
+        .map(|n| {
+            format!(
+                r#"{{"rank": {n}, "id": {n}, "type": "movie",
+                    "movie": {{"title": "Fixture Feature {n}", "year": 2030,
+                              "ids": {{"trakt": {n}, "tmdb": {n}}}}}}}"#
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+
+#[test]
+fn the_configured_client_id_wins_over_the_built_in_one() {
+    assert_eq!(
+        client_id(Some(" fixture-config-id "), "fixture-built-in-id"),
+        "fixture-config-id"
+    );
+    assert_eq!(
+        client_id(Some("   "), "fixture-built-in-id"),
+        "fixture-built-in-id"
+    );
+    assert_eq!(
+        client_id(None, "fixture-built-in-id"),
+        "fixture-built-in-id"
+    );
+    assert_eq!(client_id(None, TRAKT_CLIENT_ID), "");
+
+    // The configured id is the one Trakt sees.
+    let watchlist = api("/users/me/watchlist/movie,show/rank?page=1&limit=250");
+    let http = RecordedHttp::new().with(&watchlist, 200, "[]");
+    ok(fetch(
+        &http,
+        client_id(Some("fixture-config-id"), "fixture-built-in-id"),
+        member_request("watchlist", &[], None),
+    ));
+    assert_eq!(
+        sent_header(&http.requests()[0], "trakt-api-key"),
+        Some("fixture-config-id")
+    );
+    // Neither configured nor built in: a configuration error, no request.
+    let untouched = RecordedHttp::new();
+    let error = err(fetch(
+        &untouched,
+        client_id(None, TRAKT_CLIENT_ID),
+        member_request("watchlist", &[], None),
+    ));
+    assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(untouched.urls().is_empty());
+}
+
+#[test]
+fn a_full_paged_page_without_paging_headers_fails_instead_of_ending_the_list() {
+    let watchlist = api("/users/me/watchlist/movie,show/rank?page=1&limit=250");
+    let http = RecordedHttp::new().with(&watchlist, 200, &movie_entries(1, 250));
+    let error = err(fetch(&http, CLIENT, member_request("watchlist", &[], None)));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(!error.public_message.contains("not found"));
+    assert!(error.public_message.contains("paging headers"));
+
+    // A later page of a list counts too.
+    let list_page = items_url("/lists/7700002", 3);
+    let http = RecordedHttp::new().with(&list_page, 200, &movie_entries(501, 250));
+    let error = err(fetch(
+        &http,
+        CLIENT,
+        request("list", &[("list_id", "7700002")], Some("3")),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+
+    // A short header-less page is the whole list.
+    let http = RecordedHttp::new().with(&watchlist, 200, &movie_entries(1, 249));
+    let short = ok(fetch(&http, CLIENT, member_request("watchlist", &[], None)));
+    assert_eq!(short.items.len(), 249);
+    assert!(short.next_cursor.is_none());
+    assert!(short.fingerprint.is_some());
+}
+
+#[test]
+fn unpaged_sources_answer_in_one_response_without_paging_headers() {
+    let collection = api("/users/me/collection/movies?page=1&limit=250");
+    let http = RecordedHttp::new().with(&collection, 200, &movie_entries(1, 300));
+    let whole = ok(fetch(
+        &http,
+        CLIENT,
+        member_request("collection", &[("kind", "movies")], None),
+    ));
+    assert_eq!(whole.items.len(), 300);
+    assert!(whole.next_cursor.is_none());
+    assert!(whole.fingerprint.is_some());
+
+    let watched = api("/users/me/watched/movies?page=1&limit=250");
+    let http = RecordedHttp::new().with(&watched, 200, &movie_entries(1, 250));
+    let movies = ok(fetch(
+        &http,
+        CLIENT,
+        member_request("watched", &[("kind", "movies")], None),
+    ));
+    assert_eq!(movies.items.len(), 250);
+    assert_eq!(
+        http.urls(),
+        vec![watched],
+        "only watched shows drop seasons"
+    );
+}
+
+#[test]
+fn a_list_exactly_at_the_page_cap_is_followed_to_its_last_page() {
+    let page_count = MAX_PAGES.to_string();
+    let headers = [
+        ("X-Pagination-Limit", "250"),
+        ("X-Pagination-Page-Count", page_count.as_str()),
+        ("X-Pagination-Item-Count", "10000"),
+    ];
+    let last = MAX_PAGES.to_string();
+    let first_url = items_url("/lists/7700002", 2);
+    let last_url = items_url("/lists/7700002", MAX_PAGES);
+    let http = RecordedHttp::new()
+        .with_headers(&first_url, 200, &headers, &movie_entries(251, 250))
+        .with_headers(&last_url, 200, &headers, &movie_entries(9751, 250));
+    let middle = ok(fetch(
+        &http,
+        CLIENT,
+        request("list", &[("list_id", "7700002")], Some("2")),
+    ));
+    assert_eq!(middle.next_cursor.as_deref(), Some("3"));
+    assert_eq!(middle.total_hint, Some(10000));
+    assert_eq!(middle.items[0].rank, Some(251));
+    let end = ok(fetch(
+        &http,
+        CLIENT,
+        request("list", &[("list_id", "7700002")], Some(last.as_str())),
+    ));
+    assert!(end.next_cursor.is_none());
+    assert_eq!(end.items[0].rank, Some(9751));
+}
+
+#[test]
+fn a_list_that_grows_past_the_cap_mid_sync_fails() {
+    let page_count = (MAX_PAGES + 1).to_string();
+    let url = items_url("/lists/7700002", 2);
+    let http = RecordedHttp::new().with_headers(
+        &url,
+        200,
+        &[
+            ("X-Pagination-Limit", "250"),
+            ("X-Pagination-Page-Count", page_count.as_str()),
+            ("X-Pagination-Item-Count", "10001"),
+        ],
+        &movie_entries(251, 250),
+    );
+    let error = err(fetch(
+        &http,
+        CLIENT,
+        request("list", &[("list_id", "7700002")], Some("2")),
+    ));
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("more than 10000 entries"));
+}
+
+#[test]
+fn ranks_saturate_instead_of_overflowing_on_a_huge_page_number() {
+    let url = items_url("/lists/7700002", u32::MAX);
+    let http = RecordedHttp::new().with_headers(
+        &url,
+        200,
+        &[
+            ("X-Pagination-Limit", "250"),
+            ("X-Pagination-Page-Count", "2"),
+        ],
+        &movie_entries(1, 1),
+    );
+    let page = ok(fetch(
+        &http,
+        CLIENT,
+        request(
+            "list",
+            &[("list_id", "7700002")],
+            Some(&u32::MAX.to_string()),
+        ),
+    ));
+    assert_eq!(page.items[0].rank, Some(u32::MAX));
+    assert!(page.next_cursor.is_none());
 }
