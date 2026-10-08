@@ -9,10 +9,10 @@ description = "Simkl list provider for a member's watching, plan to watch, on ho
 official = true
 plugin_id = "simkl-list"
 catalog_versions = ["v3"]
-# The first Scryer release whose host serves
-# `scryer:lists/list-provider@1.0.0`. An older host has no list family and
-# cannot bind this artifact at all.
-min_scryer_version = "0.21.11"
+# The first Scryer release that links member accounts. The list family
+# arrived in 0.21.11, but personal sources need the 0.21.15 account flow and
+# the host-supplied app client id.
+min_scryer_version = "0.21.15"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/simkl"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/simkl"
 
