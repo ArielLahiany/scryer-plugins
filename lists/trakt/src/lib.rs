@@ -60,8 +60,8 @@ pub const PLUGIN_ID: &str = "trakt-list";
 pub const PROVIDER_TYPE: &str = "trakt";
 
 /// The client id compiled into this build, used only when the host's config
-/// carries none. It stays empty: the host supplies Scryer's own app id, or
-/// an operator's own, under [`CONFIG_CLIENT_ID`]. With neither, every fetch
+/// carries none. It stays empty: the host supplies Scryer's own app id
+/// under [`CONFIG_CLIENT_ID`]. With neither, every fetch
 /// and account call fails with a plain configuration error instead of
 /// reaching Trakt.
 pub const TRAKT_CLIENT_ID: &str = "";
@@ -192,12 +192,11 @@ pub fn descriptor() -> PluginDescriptor {
             coverage: vec![ListMediaKind::Movie, ListMediaKind::Series],
             // Trakt signs members in on auth.trakt.tv with a PKCE S256
             // challenge and no scopes; the code exchange sends the verifier,
-            // and the app secret is optional. An operator may link with their
-            // own app, whose client id the host passes in the config.
+            // through SMG, whose app client id the host passes in the config.
             auth: ListProviderAuth::MemberAccount {
                 flow: ListAccountFlow::AuthorizationCode { pkce: true },
                 exchange: ListAccountExchange::SmgRelay,
-                byo_app: true,
+                byo_app: false,
                 scopes: Vec::new(),
             },
             groups: vec![
@@ -462,7 +461,7 @@ fn member_token(credential: Option<&ListCredential>) -> Result<String, PluginErr
 /// its show. The watchlist reads Trakt's documented movies-and-shows
 /// endpoint, `/users/{id}/watchlist/movie,show/{sort}`, in the order the
 /// member picks, so watchlisted seasons and episodes stay out. Watched and
-/// collection read one type at a time and are not documented as paginated;
+/// collection also paginate, reading one type at a time;
 /// watched shows ask for `extended=noseasons`, which leaves out every
 /// season and episode Trakt would otherwise send for each show.
 fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
@@ -520,7 +519,7 @@ fn target(request: &ListPluginFetchRequest) -> Result<Target, PluginError> {
                 } else {
                     ""
                 },
-                paged: false,
+                paged: true,
                 summary_path: None,
                 site_url: None,
                 token: Some(member_token(request.credential.as_ref())?),
@@ -631,7 +630,11 @@ impl<H: ListHttp> Client<'_, H> {
             .unwrap_or(PAGE_LIMIT);
 
         let page_count = match header_number(&response, "x-pagination-page-count") {
-            Some(page_count) => page_count,
+            Some(page_count) if page_count >= page => page_count,
+            Some(0) if page == 1 && entries.is_empty() => 0,
+            Some(_) => {
+                return Err(permanent("Trakt returned inconsistent paging headers"));
+            }
             // A paged endpoint that fills a page without saying how many
             // follow may have more: ending here would read every later title
             // as having left the list.
@@ -642,7 +645,7 @@ impl<H: ListHttp> Client<'_, H> {
                     target.what
                 )));
             }
-            // A short page, or an endpoint Trakt does not page, is the last.
+            // A short header-less page is the last.
             None => page,
         };
         if page == 1 && page_count <= 1 {

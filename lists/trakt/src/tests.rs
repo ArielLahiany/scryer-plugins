@@ -193,7 +193,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
         ListProviderAuth::MemberAccount {
             flow: ListAccountFlow::AuthorizationCode { pkce: true },
             exchange: ListAccountExchange::SmgRelay,
-            byo_app: true,
+            byo_app: false,
             scopes: Vec::new(),
         }
     );
@@ -1097,31 +1097,65 @@ fn a_full_paged_page_without_paging_headers_fails_instead_of_ending_the_list() {
 }
 
 #[test]
-fn unpaged_sources_answer_in_one_response_without_paging_headers() {
-    let collection = api("/users/me/collection/movies?page=1&limit=250");
-    let http = RecordedHttp::new().with(&collection, 200, &movie_entries(1, 300));
-    let whole = ok(fetch(
-        &http,
-        CLIENT,
-        member_request("collection", &[("kind", "movies")], None),
-    ));
-    assert_eq!(whole.items.len(), 300);
-    assert!(whole.next_cursor.is_none());
-    assert!(whole.fingerprint.is_some());
-
-    let watched = api("/users/me/watched/movies?page=1&limit=250");
-    let http = RecordedHttp::new().with(&watched, 200, &movie_entries(1, 250));
-    let movies = ok(fetch(
-        &http,
-        CLIENT,
-        member_request("watched", &[("kind", "movies")], None),
-    ));
-    assert_eq!(movies.items.len(), 250);
-    assert_eq!(
-        http.urls(),
-        vec![watched],
-        "only watched shows drop seasons"
-    );
+fn watched_and_collection_require_paging_metadata_for_full_pages() {
+    for source in ["watched", "collection"] {
+        for kind in ["movies", "shows"] {
+            let query = if source == "watched" && kind == "shows" {
+                "extended=noseasons&"
+            } else {
+                ""
+            };
+            let first = api(&format!(
+                "/users/me/{source}/{kind}?{query}page=1&limit=250"
+            ));
+            for headers in [
+                vec![],
+                vec![("X-Pagination-Page-Count", "invalid")],
+                vec![("X-Pagination-Page-Count", "0")],
+            ] {
+                let http =
+                    RecordedHttp::new().with_headers(&first, 200, &headers, &movie_entries(1, 250));
+                let error = err(fetch(
+                    &http,
+                    CLIENT,
+                    member_request(source, &[("kind", kind)], None),
+                ));
+                assert_eq!(error.code, PluginErrorCode::Permanent, "{source}/{kind}");
+            }
+            // The provider may lower the page size below our requested limit.
+            let second = api(&format!(
+                "/users/me/{source}/{kind}?{query}page=2&limit=250"
+            ));
+            let headers = [
+                ("X-Pagination-Limit", "2"),
+                ("X-Pagination-Page-Count", "2"),
+            ];
+            let http = RecordedHttp::new()
+                .with_headers(&first, 200, &headers, &movie_entries(1, 2))
+                .with_headers(&second, 200, &headers, &movie_entries(3, 1));
+            let page = ok(fetch(
+                &http,
+                CLIENT,
+                member_request(source, &[("kind", kind)], None),
+            ));
+            assert_eq!(page.next_cursor.as_deref(), Some("2"));
+            assert!(page.fingerprint.is_none());
+            let page = ok(fetch(
+                &http,
+                CLIENT,
+                member_request(source, &[("kind", kind)], Some("2")),
+            ));
+            assert!(page.next_cursor.is_none());
+            assert_eq!(page.items[0].rank, Some(3));
+            let http = RecordedHttp::new().with(&first, 200, &movie_entries(1, 1));
+            let page = ok(fetch(
+                &http,
+                CLIENT,
+                member_request(source, &[("kind", kind)], None),
+            ));
+            assert!(page.next_cursor.is_none());
+        }
+    }
 }
 
 #[test]
@@ -1179,7 +1213,7 @@ fn a_list_that_grows_past_the_cap_mid_sync_fails() {
 }
 
 #[test]
-fn ranks_saturate_instead_of_overflowing_on_a_huge_page_number() {
+fn a_page_beyond_the_reported_count_is_rejected() {
     let url = items_url("/lists/7700002", u32::MAX);
     let http = RecordedHttp::new().with_headers(
         &url,
@@ -1190,7 +1224,7 @@ fn ranks_saturate_instead_of_overflowing_on_a_huge_page_number() {
         ],
         &movie_entries(1, 1),
     );
-    let page = ok(fetch(
+    let error = err(fetch(
         &http,
         CLIENT,
         request(
@@ -1199,6 +1233,6 @@ fn ranks_saturate_instead_of_overflowing_on_a_huge_page_number() {
             Some(&u32::MAX.to_string()),
         ),
     ));
-    assert_eq!(page.items[0].rank, Some(u32::MAX));
-    assert!(page.next_cursor.is_none());
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(error.public_message.contains("paging headers"));
 }

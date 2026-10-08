@@ -953,6 +953,7 @@ fn account_reads_the_identity_and_offers_every_status() {
         other => panic!("unexpected {other:?}"),
     };
     assert_eq!(http.urls(), vec![api("/users/settings")]);
+    assert_eq!(http.requests()[0].method.as_deref(), Some("GET"));
     assert_eq!(
         http.requests()[0]
             .headers
