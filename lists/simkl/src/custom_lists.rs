@@ -7,7 +7,8 @@ use super::*;
 const PAGE_LIMIT: u32 = 500;
 const MAX_ITEMS: u32 = 10_000;
 const MAX_PAGES: u32 = 20;
-// The cursor binds later pages to the same list and metadata snapshot.
+// Regular-list cursors bind later pages to the same list metadata.
+// Auto lists use a bounded content verification pass instead.
 type Cursor = (u32, String, String, u32, u32, String);
 
 pub(super) fn source_item() -> ListProviderItem {
@@ -128,6 +129,78 @@ fn page<'a>(
 }
 
 impl<H: ListHttp> Client<'_, H> {
+    async fn custom_page(&self, id: &str, requested: u32) -> Result<Value, PluginError> {
+        let response = self
+            .http
+            .send(self.request(
+                &format!("/lists/{id}"),
+                &format!("limit={PAGE_LIMIT}&page={requested}"),
+            ))
+            .await?;
+        if response.status == 403
+            && response_error_name(&response).as_deref() == Some("private_list")
+        {
+            return Err(permanent(
+                "Simkl custom list not found or no longer accessible (private_list)",
+            ));
+        }
+        check_simkl_status(&response, "Simkl custom list")?;
+        json_body(&response)
+    }
+
+    async fn verified_auto_items(
+        &self,
+        id: &str,
+        first: &Value,
+        expected: &Page,
+        mut items: Vec<ListPluginItem>,
+    ) -> Result<Vec<ListPluginItem>, PluginError> {
+        // SIMKL provides no auto-list rebuild token. Compare ordered identities on
+        // a second traversal, not updated_at. This detects inconsistent reads; it
+        // does not claim an atomic server snapshot. Never return a partial result.
+        // At most two traversals of MAX_PAGES; no in-call retry loop.
+        let pages = expected.total.div_ceil(expected.limit);
+        let media = first["media_type"].as_str().ok_or_else(malformed)?;
+        let mut seen: BTreeSet<_> = items.iter().map(|item| item.item_key.clone()).collect();
+        for verifying in [false, true] {
+            let start = if verifying { 1 } else { 2 };
+            for requested in start..=pages {
+                let body = self.custom_page(id, requested).await?;
+                let (entries, paging) = page(&body, "items", requested)?;
+                if numeric_id(body.get("id"))? != id
+                    || paging.total != expected.total
+                    || paging.limit != expected.limit
+                    || ["type", "media_type", "updated_at", "sort"]
+                        .iter()
+                        .any(|key| body.get(*key) != first.get(*key))
+                {
+                    return Err(malformed());
+                }
+                for (index, entry) in entries.iter().enumerate() {
+                    let mut item = custom_item(entry, media)?;
+                    let offset = ((requested - 1) * paging.limit) as usize + index;
+                    if verifying {
+                        if items
+                            .get(offset)
+                            .is_none_or(|prior| prior.item_key != item.item_key)
+                        {
+                            return Err(permanent(
+                                "Simkl auto list changed during pagination; retry the complete list",
+                            ));
+                        }
+                    } else {
+                        if !seen.insert(item.item_key.clone()) {
+                            return Err(malformed());
+                        }
+                        item.rank = Some(offset as u32 + 1);
+                        items.push(item);
+                    }
+                }
+            }
+        }
+        Ok(items)
+    }
+
     pub(super) async fn custom_lists(
         &self,
         user_id: &str,
@@ -204,13 +277,7 @@ impl<H: ListHttp> Client<'_, H> {
         {
             return Err(invalid_config("Invalid Simkl custom-list page cursor"));
         }
-        let body = self
-            .get_json(
-                &format!("/lists/{id}"),
-                &format!("limit={PAGE_LIMIT}&page={requested}"),
-                "Simkl custom list",
-            )
-            .await?;
+        let body = self.custom_page(&id, requested).await?;
         let (entries, paging) = page(&body, "items", requested)?;
         if numeric_id(body.get("id"))? != id {
             return Err(malformed());
@@ -241,6 +308,20 @@ impl<H: ListHttp> Client<'_, H> {
             // Preserve response order; leave sort/direction unset to honor the owner.
             item.rank = Some((requested - 1) * paging.limit + index as u32 + 1);
             items.push(item);
+        }
+        if body.get("type").and_then(Value::as_str) == Some("auto") {
+            if cursor.is_some() {
+                return Err(malformed());
+            }
+            if paging.next.is_some() {
+                items = self.verified_auto_items(&id, &body, &paging, items).await?;
+            }
+            return Ok(ListPluginFetchResponse {
+                items,
+                total_hint: Some(paging.total),
+                list_name: json_text(body.get("name")),
+                ..Default::default()
+            });
         }
         let next_cursor = paging
             .next

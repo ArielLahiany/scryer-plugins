@@ -1400,3 +1400,125 @@ fn custom_discovery_fails_on_malformed_pages_and_outages_instead_of_hiding_lists
         assert!(block_on(account(&http, CLIENT_ID, &credential())).is_err());
     }
 }
+
+fn auto_pages() -> (Value, Value) {
+    let mut first = custom_body("movies", custom_media("movie", 1));
+    first["type"] = "auto".into();
+    first["items"] = (1..=500)
+        .map(|id| custom_media("movie", id))
+        .collect::<Vec<_>>()
+        .into();
+    first["pagination"] =
+        serde_json::json!({"page":1,"limit":500,"total_items":501,"total_pages":2});
+    let mut second = first.clone();
+    second["pagination"]["page"] = 2.into();
+    second["items"] = serde_json::json!([custom_media("movie", 501)]);
+    (first, second)
+}
+
+#[test]
+fn custom_auto_pages_verify_membership_before_returning_any_items() {
+    let (first, second) = auto_pages();
+    let http = RecordedHttp::new()
+        .with(&custom_url(1), 200, &first.to_string())
+        .with(&custom_url(2), 200, &second.to_string());
+    let result = fetch_ok(&http, &custom_request());
+    assert_eq!(result.items.len(), 501);
+    assert_eq!(result.items.last().unwrap().rank, Some(501));
+    assert!(result.next_cursor.is_none());
+    assert_eq!(
+        http.urls(),
+        [custom_url(1), custom_url(2), custom_url(1), custom_url(2)]
+    );
+}
+
+struct RebuiltAutoList {
+    reads: std::cell::Cell<usize>,
+    before: RecordedHttp,
+    after: RecordedHttp,
+}
+
+impl ListHttp for RebuiltAutoList {
+    async fn send(&self, request: PluginHttpRequest) -> Result<PluginHttpResponse, PluginError> {
+        let read = self.reads.get();
+        self.reads.set(read + 1);
+        if read == 0 {
+            self.before.send(request).await
+        } else {
+            self.after.send(request).await
+        }
+    }
+}
+
+#[test]
+fn custom_auto_rebuild_with_unchanged_metadata_is_rejected() {
+    for reorder_only in [false, true] {
+        let (first, second) = auto_pages();
+        let mut rebuilt = first.clone();
+        if reorder_only {
+            rebuilt["items"].as_array_mut().unwrap().swap(0, 1);
+        } else {
+            // Same size and timestamp, and no duplicate at the page boundary.
+            rebuilt["items"][0] = custom_media("movie", 502);
+        }
+        let http = RebuiltAutoList {
+            reads: std::cell::Cell::new(0),
+            before: RecordedHttp::new().with(&custom_url(1), 200, &first.to_string()),
+            after: RecordedHttp::new()
+                .with(&custom_url(1), 200, &rebuilt.to_string())
+                .with(&custom_url(2), 200, &second.to_string()),
+        };
+        let error = block_on(fetch(&http, CLIENT_ID, &custom_request())).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(error.public_message.contains("changed during pagination"));
+        assert_eq!(http.reads.get(), 3);
+    }
+}
+
+#[test]
+fn custom_auto_duplicate_pages_and_verification_outages_fail_closed() {
+    let (first, mut second) = auto_pages();
+    second["items"][0] = custom_media("movie", 1);
+    let http = RecordedHttp::new()
+        .with(&custom_url(1), 200, &first.to_string())
+        .with(&custom_url(2), 200, &second.to_string());
+    assert_eq!(
+        fetch_err(&http, &custom_request()).code,
+        PluginErrorCode::Permanent
+    );
+    let (_, second) = auto_pages();
+    let http = RebuiltAutoList {
+        reads: std::cell::Cell::new(0),
+        before: RecordedHttp::new().with(&custom_url(1), 200, &first.to_string()),
+        after: RecordedHttp::new().with(&custom_url(1), 503, "{}").with(
+            &custom_url(2),
+            200,
+            &second.to_string(),
+        ),
+    };
+    assert_eq!(
+        block_on(fetch(&http, CLIENT_ID, &custom_request()))
+            .unwrap_err()
+            .code,
+        PluginErrorCode::UpstreamUnavailable
+    );
+}
+
+#[test]
+fn custom_private_list_is_gone_but_scope_errors_still_require_reconnection() {
+    for (name, code, gone) in [
+        ("private_list", PluginErrorCode::Permanent, true),
+        ("insufficient_scope", PluginErrorCode::AuthFailed, false),
+        ("oauth2_token_required", PluginErrorCode::AuthFailed, false),
+        ("other", PluginErrorCode::Permanent, false),
+    ] {
+        let http = RecordedHttp::new().with(
+            &custom_url(1),
+            403,
+            &serde_json::json!({"error":name}).to_string(),
+        );
+        let error = fetch_err(&http, &custom_request());
+        assert_eq!(error.code, code);
+        assert_eq!(error.public_message.contains("not found"), gone);
+    }
+}
