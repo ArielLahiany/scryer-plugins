@@ -1,9 +1,9 @@
 [package]
 name = "simkl-list-provider"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Simkl list provider for a member's watching, plan to watch, on hold, completed and dropped lists"
+description = "Simkl watchlists and custom lists for movies, shows and anime"
 
 [package.metadata.scryer]
 official = true

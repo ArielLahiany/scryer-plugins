@@ -282,7 +282,11 @@ fn every_status_is_a_personal_six_hour_source() {
     let list = list_descriptor();
     assert_eq!(list.groups.len(), 1);
     assert_eq!(list.groups[0].auth_badge, ListAuthBadge::MemberAccount);
-    let items = &list.groups[0].items;
+    let items: Vec<_> = list.groups[0]
+        .items
+        .iter()
+        .filter(|item| item.source_type != SOURCE_LIST)
+        .collect();
     let sources: Vec<_> = items.iter().map(|item| item.source_type.as_str()).collect();
     assert_eq!(
         sources,
@@ -941,7 +945,7 @@ fn malformed_library_responses_are_permanent_failures() {
 
 #[test]
 fn account_reads_the_identity_and_offers_every_status() {
-    let http = RecordedHttp::new().with(&api("/users/settings"), 200, SETTINGS);
+    let http = settings_http(SETTINGS);
     let account = match block_on(run(
         &http,
         CLIENT_ID,
@@ -952,7 +956,10 @@ fn account_reads_the_identity_and_offers_every_status() {
         PluginListCommandResult::Account(PluginResult::Ok(account)) => account,
         other => panic!("unexpected {other:?}"),
     };
-    assert_eq!(http.urls(), vec![api("/users/settings")]);
+    assert_eq!(
+        http.urls(),
+        vec![api("/users/settings"), custom_index_url("990001", 1)]
+    );
     assert_eq!(http.requests()[0].method.as_deref(), Some("GET"));
     assert_eq!(
         http.requests()[0]
@@ -1007,7 +1014,7 @@ fn account_reads_the_identity_and_offers_every_status() {
 fn account_tolerates_a_private_profile_but_needs_an_id() {
     let private =
         r#"{"user": {"name": "", "avatar": "/img/default.png"}, "account": {"id": "990002"}}"#;
-    let http = RecordedHttp::new().with(&api("/users/settings"), 200, private);
+    let http = settings_http(private);
     let profile = block_on(account(&http, CLIENT_ID, &credential())).unwrap();
     assert_eq!(profile.external_user_id, "990002");
     assert_eq!(profile.username, "990002");
@@ -1061,11 +1068,17 @@ fn the_configured_client_id_wins_over_the_built_in_one() {
     );
     assert_eq!(client_id(None, SIMKL_CLIENT_ID), "");
 
-    let http = RecordedHttp::new().with(
-        &api("/users/settings").replace(CLIENT_ID, "fixture-config-id"),
-        200,
-        SETTINGS,
-    );
+    let http = RecordedHttp::new()
+        .with(
+            &api("/users/settings").replace(CLIENT_ID, "fixture-config-id"),
+            200,
+            SETTINGS,
+        )
+        .with(
+            &custom_index_url("990001", 1).replace(CLIENT_ID, "fixture-config-id"),
+            200,
+            PREMIUM,
+        );
     block_on(account(
         &http,
         client_id(Some("fixture-config-id"), "fixture-built-in-id"),
@@ -1135,4 +1148,255 @@ fn a_status_too_large_to_build_is_a_permanent_failure_that_says_why() {
     assert!(error.public_message.contains("too large"));
     assert!(!error.public_message.contains("not found"));
     assert!(!error.public_message.contains("Too many episodes"));
+}
+
+const PREMIUM: &str = r#"{"error":"premium_only","item":{"title":"Upgrade"}}"#;
+
+fn custom_index_url(user: &str, page: u32) -> String {
+    format!(
+        "{}&limit=500&page={page}",
+        api(&format!("/lists/user/{user}"))
+    )
+}
+
+fn custom_url(page: u32) -> String {
+    format!("{}&limit=500&page={page}", api("/lists/9909"))
+}
+
+fn settings_http(settings: &str) -> RecordedHttp {
+    let body: Value = serde_json::from_str(settings).unwrap();
+    let id = json_id(body.get("account").unwrap().get("id")).unwrap();
+    RecordedHttp::new()
+        .with(&api("/users/settings"), 200, settings)
+        .with(&custom_index_url(&id, 1), 200, PREMIUM)
+}
+
+fn custom_request() -> ListPluginFetchRequest {
+    let mut request = request(SOURCE_LIST, None, None);
+    request.params.insert(PARAM_LIST_ID.into(), "9909".into());
+    request
+}
+
+fn custom_body(media: &str, item: Value) -> Value {
+    serde_json::json!({
+        "id":9909, "name":"Fixture custom list", "media_type":media,
+        "type":"regular", "updated_at":"2035-01-01T00:00:00Z",
+        "pagination":{"page":1,"limit":500,"total_items":1,"total_pages":1},
+        "items":[item]
+    })
+}
+
+fn custom_media(kind: &str, id: u32) -> Value {
+    serde_json::json!({"type":kind,"title":"Fixture title","year":2030,
+        "ids":{"simkl_id":id,"tmdb":"770301","imdb":"tt9900301"}})
+}
+
+#[test]
+fn custom_source_uses_the_existing_host_owned_list_contract() {
+    let descriptor = list_descriptor();
+    let source = descriptor.groups[0]
+        .items
+        .iter()
+        .find(|item| item.source_type == "list")
+        .unwrap();
+    assert!(source.personal);
+    assert_eq!(source.params[0].key, "list_id");
+    assert!(source.params[0].required);
+    assert_eq!(source.kinds.len(), 3);
+}
+
+#[test]
+fn custom_discovery_pages_owned_lists_without_fetching_their_contents() {
+    let first = serde_json::json!({"pagination":{"page":1,"limit":2,"total_items":3,"total_pages":2},
+        "lists":[{"id":991,"name":"Fixture private movies","privacy":"private","media_type":"movies"},
+                 {"id":992,"name":"Fixture unlisted TV","privacy":"unlisted","media_type":"tv"}]});
+    let second = serde_json::json!({"pagination":{"page":2,"limit":2,"total_items":3,"total_pages":2},
+        "lists":[{"id":993,"name":"Fixture anime","media_type":"anime"}]});
+    let http = RecordedHttp::new()
+        .with(&api("/users/settings"), 200, SETTINGS)
+        .with(&custom_index_url("990001", 1), 200, &first.to_string())
+        .with(&custom_index_url("990001", 2), 200, &second.to_string());
+    let response = block_on(account(&http, CLIENT_ID, &credential())).unwrap();
+    assert_eq!(
+        response
+            .owned_lists
+            .iter()
+            .map(|list| list.id.as_str())
+            .collect::<Vec<_>>(),
+        ["991", "992", "993"]
+    );
+    assert_eq!(response.owned_lists[0].kinds, [ListMediaKind::Movie]);
+    assert_eq!(response.owned_lists[1].kinds, [ListMediaKind::Series]);
+    assert_eq!(
+        response.owned_lists[2].kinds,
+        [ListMediaKind::Anime, ListMediaKind::Movie]
+    );
+    assert_eq!(response.statuses.len(), 5);
+    assert_eq!(
+        http.urls(),
+        [
+            api("/users/settings"),
+            custom_index_url("990001", 1),
+            custom_index_url("990001", 2)
+        ]
+    );
+}
+
+#[test]
+fn custom_items_keep_stable_keys_and_typed_ids_for_movies_tv_and_anime() {
+    for (media, kind, subtype, expected, key_scope, id_kind) in [
+        (
+            "movies",
+            "movie",
+            None,
+            ListMediaKind::Movie,
+            "movie",
+            "movie",
+        ),
+        ("tv", "tv", None, ListMediaKind::Series, "show", "series"),
+        (
+            "anime",
+            "anime",
+            Some("tv"),
+            ListMediaKind::Anime,
+            "anime",
+            "series",
+        ),
+        (
+            "anime",
+            "anime",
+            Some("movie"),
+            ListMediaKind::Movie,
+            "anime",
+            "movie",
+        ),
+    ] {
+        let mut item = custom_media(kind, 9900301);
+        if let Some(subtype) = subtype {
+            item["anime_type"] = subtype.into();
+        }
+        let body = custom_body(media, item);
+        let http = RecordedHttp::new().with(&custom_url(1), 200, &body.to_string());
+        let response = fetch_ok(&http, &custom_request());
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.item_key, format!("simkl:{key_scope}:9900301"));
+        assert_eq!(item.kind_hint, Some(expected));
+        assert_eq!(item.rank, Some(1));
+        assert!(ids_of(item).contains(&("tmdb", "770301", Some(id_kind))));
+        assert!(response.fingerprint.is_none());
+        assert_eq!(http.urls(), [custom_url(1)]);
+        assert_eq!(
+            http.requests()[0].headers["Authorization"],
+            format!("Bearer {TOKEN}")
+        );
+        assert!(!http.urls()[0].contains(TOKEN));
+    }
+}
+
+#[test]
+fn custom_paging_rejects_changed_snapshots_and_reuses_the_owners_order() {
+    let mut first = custom_body("movies", custom_media("movie", 9900301));
+    first["pagination"] = serde_json::json!({"page":1,"limit":1,"total_items":2,"total_pages":2});
+    let mut second = first.clone();
+    second["pagination"]["page"] = 2.into();
+    second["items"][0] = custom_media("movie", 9900302);
+    let http = RecordedHttp::new()
+        .with(&custom_url(1), 200, &first.to_string())
+        .with(&custom_url(2), 200, &second.to_string());
+    let first_response = fetch_ok(&http, &custom_request());
+    let mut request = custom_request();
+    request.page_cursor = first_response.next_cursor;
+    let response = fetch_ok(&http, &request);
+    assert_eq!(response.items[0].rank, Some(2));
+    assert!(response.next_cursor.is_none());
+    assert_eq!(http.urls(), [custom_url(1), custom_url(2)]);
+    second["updated_at"] = "2035-01-02T00:00:00Z".into();
+    let changed = RecordedHttp::new().with(&custom_url(2), 200, &second.to_string());
+    assert_eq!(
+        fetch_err(&changed, &request).code,
+        PluginErrorCode::Permanent
+    );
+}
+
+#[test]
+fn custom_lists_never_treat_errors_or_partial_data_as_empty_membership() {
+    let valid = custom_body("movies", custom_media("movie", 9900301));
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("items");
+    let mut truncated = valid.clone();
+    truncated["items"] = serde_json::json!([]);
+    let mut oversized = valid.clone();
+    oversized["pagination"]["total_items"] = 10001.into();
+    let mut mismatched = valid.clone();
+    mismatched["id"] = 9910.into();
+    let mut wrong_kind = valid.clone();
+    wrong_kind["items"][0]["type"] = "episode".into();
+    let mut unknown_anime = custom_body("anime", custom_media("anime", 9900301));
+    unknown_anime["items"][0]["anime_type"] = Value::Null;
+    for body in [
+        serde_json::from_str(PREMIUM).unwrap(),
+        missing,
+        truncated,
+        oversized,
+        mismatched,
+        wrong_kind,
+        unknown_anime,
+    ] {
+        let http = RecordedHttp::new().with(&custom_url(1), 200, &body.to_string());
+        assert_eq!(
+            fetch_err(&http, &custom_request()).code,
+            PluginErrorCode::Permanent
+        );
+    }
+    for (status, code) in [
+        (401, PluginErrorCode::AuthFailed),
+        (403, PluginErrorCode::Permanent),
+        (404, PluginErrorCode::Permanent),
+        (429, PluginErrorCode::RateLimited),
+        (503, PluginErrorCode::UpstreamUnavailable),
+    ] {
+        let http = RecordedHttp::new().with(&custom_url(1), status, "{}");
+        assert_eq!(fetch_err(&http, &custom_request()).code, code);
+    }
+}
+
+#[test]
+fn custom_empty_lists_are_valid_and_auto_lists_are_never_timestamp_short_circuited() {
+    let mut body = custom_body("movies", custom_media("movie", 9900301));
+    body["type"] = "auto".into();
+    let http = RecordedHttp::new().with(&custom_url(1), 200, &body.to_string());
+    let mut request = custom_request();
+    request.since_fingerprint = Some("2035-01-01T00:00:00Z".into());
+    assert!(!fetch_ok(&http, &request).unchanged);
+    body["items"] = serde_json::json!([]);
+    body["pagination"] = serde_json::json!({"page":1,"limit":500,"total_items":0,"total_pages":0});
+    let empty = RecordedHttp::new().with(&custom_url(1), 200, &body.to_string());
+    assert!(fetch_ok(&empty, &request).items.is_empty());
+}
+
+#[test]
+fn custom_bad_ids_cursors_and_missing_credentials_do_not_make_requests() {
+    let http = RecordedHttp::new();
+    let mut bad = custom_request();
+    bad.params
+        .insert(PARAM_LIST_ID.into(), "../users/settings".into());
+    assert_eq!(fetch_err(&http, &bad).code, PluginErrorCode::InvalidConfig);
+    let mut bad = custom_request();
+    bad.page_cursor = Some("not-a-cursor".into());
+    assert_eq!(fetch_err(&http, &bad).code, PluginErrorCode::InvalidConfig);
+    let mut bad = custom_request();
+    bad.credential = None;
+    assert_eq!(fetch_err(&http, &bad).code, PluginErrorCode::AuthFailed);
+    assert!(http.urls().is_empty());
+}
+
+#[test]
+fn custom_discovery_fails_on_malformed_pages_and_outages_instead_of_hiding_lists() {
+    for (status, body) in [(200, "{}"), (503, "{}"), (200, r#"{"error":"unexpected"}"#)] {
+        let http = RecordedHttp::new()
+            .with(&api("/users/settings"), 200, SETTINGS)
+            .with(&custom_index_url("990001", 1), status, body);
+        assert!(block_on(account(&http, CLIENT_ID, &credential())).is_err());
+    }
 }
