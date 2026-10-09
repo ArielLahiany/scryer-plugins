@@ -1,5 +1,8 @@
 //! Simkl list provider.
 //!
+//! Custom lists are discovered through `/lists/user/{id}` and read through
+//! `/lists/{id}` using AUTH V2. Watchlist status handling remains separate.
+//!
 //! Simkl keeps one library per member, split into shows, anime and movies and
 //! sorted by status: watching, plan to watch, on hold, completed and dropped
 //! (movies are never watching or on hold). Each source here is one of those
@@ -60,6 +63,8 @@ use scryer_plugin_sdk::{
 };
 use serde_json::Value;
 
+mod custom_lists;
+
 wit_bindgen::generate!({
     world: "scryer:lists/list-provider@1.0.0",
     path: ["wit/host-v1.0.0", "wit/runtime-v1.0.0", "wit/list-v1.0.0"],
@@ -86,6 +91,9 @@ pub const SOURCE_PLAN_TO_WATCH: &str = "plantowatch";
 pub const SOURCE_ON_HOLD: &str = "hold";
 pub const SOURCE_COMPLETED: &str = "completed";
 pub const SOURCE_DROPPED: &str = "dropped";
+/// Uses the host's generic owned-list source and parameter contract.
+pub const SOURCE_LIST: &str = "list";
+pub const PARAM_LIST_ID: &str = "list_id";
 
 /// Narrows a status to one of Simkl's libraries; absent or `all` reads every
 /// library the status exists in.
@@ -313,10 +321,10 @@ pub fn descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
-            summary: Some("A Simkl member's movies, shows and anime by status".to_string()),
+            summary: Some("Simkl watchlists and custom lists for movies, shows and anime".to_string()),
             blurb: Some(
                 "Link a Simkl account to follow what it is watching, plans to watch, has on \
-                 hold, completed or dropped. Titles are matched by the ids Simkl keeps for \
+                 hold, completed or dropped, and your custom lists (PRO/VIP). Titles are matched by the ids Simkl keeps for \
                  them, and each anime season is its own entry."
                     .to_string(),
             ),
@@ -347,7 +355,8 @@ pub fn descriptor() -> PluginDescriptor {
             groups: vec![ListProviderGroup {
                 label: "Your Simkl library".to_string(),
                 auth_badge: ListAuthBadge::MemberAccount,
-                items: Status::ALL.into_iter().map(status_item).collect(),
+                items: Status::ALL.into_iter().map(status_item)
+                    .chain(std::iter::once(custom_lists::source_item())).collect(),
             }],
             notes: vec![ListProviderNote {
                 tone: ListNoteTone::Info,
@@ -422,6 +431,11 @@ pub async fn fetch<H: ListHttp>(
     client_id: &str,
     request: &ListPluginFetchRequest,
 ) -> Result<ListPluginFetchResponse, PluginError> {
+    if request.source_type == SOURCE_LIST {
+        return Client::new(http, client_id, request.credential.as_ref())?
+            .custom_list(request)
+            .await;
+    }
     let status = Status::parse(&request.source_type)
         .ok_or_else(|| unsupported_source(&request.source_type))?;
     let libraries = libraries(status, request)?;
@@ -567,12 +581,13 @@ impl<'a, H: ListHttp> Client<'a, H> {
         let name = json_text(user.and_then(|user| user.get("name")));
         let avatar_url = json_text(user.and_then(|user| user.get("avatar")))
             .filter(|url| url.starts_with("https://") || url.starts_with("http://"));
+        let owned_lists = self.custom_lists(&external_user_id).await?;
         Ok(ListPluginAccountResponse {
             username: name.clone().unwrap_or_else(|| external_user_id.clone()),
             external_user_id,
             display_name: name,
             avatar_url,
-            owned_lists: Vec::new(),
+            owned_lists,
             statuses: Status::ALL
                 .into_iter()
                 .map(|status| ListAccountStatus {
